@@ -118,5 +118,5 @@ warn_unreachable = true
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["flash_attn", "flash_attn.*"]
+module = ["flash_attn", "flash_attn.*", "flash_attn_3", "flash_attn_3.*"]
 ignore_missing_imports = true

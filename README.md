@@ -37,8 +37,8 @@ implicit importance-sampling scheme for reducing Monte Carlo variance.
 
 The learned positive semidefinite kernel and its positive random feature estimator
 come from the paper. Runtime mode selection, feature count, redraw timing, exact
-attention cutoff, language-model dimensions, and backend dispatch are library
-configuration choices.
+attention cutoff, per-head geometry, low-rank geometry, orthogonal feature blocks,
+model depth, and backend dispatch are configurable library choices.
 
 ## Installation
 
@@ -57,7 +57,10 @@ python -m pip install -e ".[dev]"
 PyTorch is the only runtime dependency. FlashAttention is optional and should be
 installed separately for a compatible CUDA, PyTorch, and GPU environment.
 
-## Attention
+## Self-attention
+
+`DarkformerAttention` is the primary attention API and an alias of
+`SelfAttention`.
 
 ```python
 import torch
@@ -69,8 +72,9 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 attention = DarkformerAttention(
     dim=512,
     heads=8,
-    dim_head=64,
+    head_dim=64,
     num_features=256,
+    geometry_rank=64,
     attention_mode="linear",
     causal=True,
 ).to(device)
@@ -81,8 +85,12 @@ output = attention(x, mask=mask)
 ```
 
 The input and output shapes are `(batch, sequence, dim)`. A boolean `mask` has shape
-`(batch, sequence)`, where `True` marks a valid token. Causal attention can be set on
-the module and combines with the token mask.
+`(batch, sequence)`, where `True` marks a valid token. Causal attention combines the
+token mask with the causal constraint.
+
+Set `per_head_geometry=False` to share the learned geometry across heads. Set
+`orthogonal_features=False` to use independent Gaussian features instead of
+orthogonal Gaussian blocks.
 
 ### Attention modes
 
@@ -90,46 +98,156 @@ the module and combines with the token mask.
 
 | Mode | Behavior |
 | --- | --- |
-| `"linear"` | Uses the positive random feature estimator and associative linear attention. |
+| `"linear"` | Uses positive random features and associative linear attention. |
 | `"exact"` | Evaluates the learned kernel with exact softmax attention. |
-| `"auto"` | Uses exact attention for short inputs and linear attention above the configured cutoff. |
+| `"auto"` | Uses exact attention through `exact_threshold`, then linear attention. |
+
+For automatic selection, provide the cutoff explicitly:
+
+```python
+attention = DarkformerAttention(
+    512,
+    heads=8,
+    attention_mode="auto",
+    exact_threshold=1024,
+    exact_backend="auto",
+).to("cuda")
+```
 
 The exact path applies the learned geometry to queries and keys before scaled
-dot-product attention. It attempts FlashAttention 3, then FlashAttention 2, when an
-installed backend supports the device, dtype, head dimension, causality, and mask.
-It otherwise uses PyTorch scaled dot-product attention. Optional FlashAttention
-packages are never required to import or run `darkformer`.
+dot-product attention. `exact_backend="auto"` attempts FlashAttention 3, then
+FlashAttention 2, when an installed backend supports the device, dtype, head
+dimension, dropout, causality, and mask. It otherwise uses PyTorch scaled dot-product
+attention. Set `exact_backend` to `"flash3"`, `"flash2"`, or `"sdpa"` to request a
+specific backend. A forced FlashAttention backend raises an error when its package or
+required hardware support is unavailable.
 
+Optional FlashAttention packages are never required to import or run `darkformer`.
 FlashAttention only serves the exact learned-kernel path. The linear positive random
 feature path has no softmax score matrix for a FlashAttention kernel to compute.
 
-### Random feature redraw
+## Cross-attention
 
-Projection redraw is explicit. This avoids changing the estimator as a side effect
-of a forward pass:
+`CrossAttention` keeps query and context masks separate. It has no causal or rotary
+option because position handling belongs to the surrounding encoder-decoder model.
 
 ```python
-attention.redraw_projection_matrix()
+import torch
+
+from darkformer import CrossAttention
+
+cross_attention = CrossAttention(
+    dim=512,
+    heads=8,
+    head_dim=64,
+    num_features=256,
+    attention_mode="linear",
+).to("cuda")
+
+x = torch.randn(2, 256, 512, device="cuda")
+context = torch.randn(2, 1024, 512, device="cuda")
+mask = torch.ones(2, 256, dtype=torch.bool, device="cuda")
+context_mask = torch.ones(2, 1024, dtype=torch.bool, device="cuda")
+
+output = cross_attention(
+    x,
+    context,
+    mask=mask,
+    context_mask=context_mask,
+)
 ```
 
-Call redraw at a training boundary chosen by the application. Evaluation remains
-deterministic until the next explicit redraw.
+## Projection lifecycle
 
-### Mixed precision
+Random projections stay unchanged unless a redraw is requested. The default
+`feature_redraw_interval=None` disables scheduled redraws. A positive interval
+redraws after that many training forwards. Evaluation forwards do not advance the
+schedule.
 
-Move the module to CUDA and choose a model dtype in the usual PyTorch manner:
+All public attention and model modules expose the same in-place lifecycle methods:
+
+```python
+attention.redraw_projection_matrices_()
+attention.fix_projection_matrices_()
+attention.redraw_projection_matrices_(force=True)
+attention.unfix_projection_matrices_()
+```
+
+Fixed projections ignore ordinary manual and scheduled redraws. Pass `force=True`
+for an intentional one-time redraw while fixed. `projection_seed` makes initial
+projections reproducible independently of PyTorch's global random state.
+`deterministic=True` fixes projection matrices at construction.
+
+For a scheduled training policy:
+
+```python
+from darkformer import SelfAttention
+
+attention = SelfAttention(
+    512,
+    num_features=256,
+    feature_redraw_interval=1_000,
+    projection_seed=7,
+)
+```
+
+## Mixed precision
+
+Move the module to CUDA and select a model dtype with standard PyTorch operations:
 
 ```python
 attention = attention.to("cuda", dtype=torch.bfloat16)
 x = x.to("cuda", dtype=torch.bfloat16)
+mask = mask.to("cuda")
 
 with torch.autocast("cuda", dtype=torch.bfloat16):
-    output = attention(x, mask=mask.to("cuda"))
+    output = attention(x, mask=mask)
 ```
 
 `bfloat16` is generally preferable where supported because of its wider exponent
-range. Numerically sensitive normalization and reduction operations use stable
+range. Numerically sensitive feature normalization and reductions use stable
 accumulation before results are returned in the model dtype.
+
+## Transformer stacks
+
+`Darkformer` applies DARKformer attention and feed-forward layers to continuous
+embeddings. Use `cross_attend=True` to add a context-attention sublayer.
+
+```python
+import torch
+
+from darkformer import Darkformer
+
+encoder = Darkformer(
+    dim=512,
+    depth=8,
+    heads=8,
+    num_features=256,
+    causal=False,
+).to("cuda")
+
+decoder = Darkformer(
+    dim=512,
+    depth=8,
+    heads=8,
+    num_features=256,
+    causal=True,
+    cross_attend=True,
+).to("cuda")
+
+source = torch.randn(2, 1024, 512, device="cuda")
+target = torch.randn(2, 256, 512, device="cuda")
+source_mask = torch.ones(2, 1024, dtype=torch.bool, device="cuda")
+target_mask = torch.ones(2, 256, dtype=torch.bool, device="cuda")
+
+context = encoder(source, mask=source_mask)
+output = decoder(
+    target,
+    mask=target_mask,
+    context=context,
+    context_mask=source_mask,
+)
+```
 
 ## Language model
 
@@ -141,11 +259,11 @@ import torch
 from darkformer import DarkformerLM
 
 model = DarkformerLM(
-    num_tokens=32_000,
+    vocab_size=32_000,
     dim=512,
     depth=8,
     heads=8,
-    dim_head=64,
+    head_dim=64,
     num_features=256,
     max_seq_len=4096,
     attention_mode="linear",
@@ -155,23 +273,83 @@ tokens = torch.randint(0, 32_000, (2, 1024), device="cuda")
 mask = torch.ones_like(tokens, dtype=torch.bool)
 logits = model(tokens, mask=mask)
 
-model.redraw_projection_matrices()
+model.redraw_projection_matrices_()
 ```
 
-The returned logits have shape `(batch, sequence, num_tokens)`.
+The returned logits have shape `(batch, sequence, vocab_size)`. `max_seq_len` is an
+optional input validation limit. `DarkformerLM` uses rotary position information
+rather than learned absolute position embeddings by default.
+
+## Encoder-decoder model and generation
+
+`DarkformerEncDec` builds an encoder, a causal decoder, token embeddings, and output
+projection. `encoder_depth` and `decoder_depth` can override the common `depth`.
+
+```python
+import torch
+
+from darkformer import DarkformerEncDec
+
+model = DarkformerEncDec(
+    source_vocab_size=32_000,
+    target_vocab_size=32_000,
+    dim=512,
+    depth=8,
+    heads=8,
+    num_features=256,
+    max_source_length=4096,
+    max_target_length=1024,
+    attention_mode="linear",
+).to("cuda")
+
+source_tokens = torch.randint(0, 32_000, (2, 1024), device="cuda")
+target_tokens = torch.randint(0, 32_000, (2, 256), device="cuda")
+source_mask = torch.ones_like(source_tokens, dtype=torch.bool)
+target_mask = torch.ones_like(target_tokens, dtype=torch.bool)
+
+logits = model(
+    source_tokens,
+    target_tokens,
+    source_mask=source_mask,
+    target_mask=target_mask,
+)
+loss = model(
+    source_tokens,
+    target_tokens,
+    source_mask=source_mask,
+    target_mask=target_mask,
+    labels=target_tokens,
+)
+```
+
+Generate autoregressively from a target prompt:
+
+```python
+prompt = target_tokens[:, :1]
+generated = model.generate(
+    source_tokens,
+    prompt,
+    max_new_tokens=128,
+    source_mask=source_mask,
+    eos_token_id=2,
+    temperature=0.8,
+    top_k=50,
+)
+```
 
 ## Benchmark
 
-The benchmark compares `linear`, `exact`, and `auto` modes using the same public
-attention API. It does not import an optional FlashAttention package directly, so
-the exact mode remains available through PyTorch on any supported installation.
+The benchmark compares `linear`, `exact`, and `auto` modes using the public
+self-attention API. It does not import an optional FlashAttention package directly,
+so exact attention remains available through PyTorch on any supported installation.
 
 ```bash
 python benchmarks/benchmark_attention.py --device cuda --dtype bfloat16
 ```
 
-Run the benchmark with `--help` to configure sequence lengths, feature count, model
-dimensions, warmup, and measurement iterations.
+Use `--exact-backend sdpa` for a PyTorch-only comparison. Run with `--help` to
+configure sequence lengths, feature count, model dimensions, masks, warmup, and
+measurement iterations.
 
 ## References
 
