@@ -2,9 +2,9 @@
 
 # Data-Aware Random Feature Kernels for Transformers (DARKformer)
 
-[![PyPI version](https://badge.fury.io/py/darkformer.svg)](https://badge.fury.io/py/darkformer)
+[![PyPI version](https://badge.fury.io/py/darkformer-pytorch.svg)](https://badge.fury.io/py/darkformer-pytorch)
 
-The `darkformer` package provides a PyTorch implementation of the data-aware random feature
+The `darkformer-pytorch` package provides a PyTorch implementation of the data-aware random feature
 kernel described in the [Data-Aware Random Feature Kernel for
 Transformers](https://arxiv.org/abs/2603.04127) paper by Google Deepmind. It follows the positive random
 feature formulation used by Performer while learning the projection geometry from
@@ -43,7 +43,7 @@ feature map is
     - \frac{1}{2} x^\mathsf{T} \Sigma x
   \right),
 \qquad
-\omega_j \sim \mathcal{N}(0, I). 
+\omega_j \sim \mathcal{N}(0, I).
 ```
 <br></br>
 The finite feature map approximates the learned kernel, and normalized attention
@@ -73,13 +73,13 @@ model depth, and backend dispatch are configurable library choices.
 
 ## Installation
 
-Install the package from the repository root:
+Install from PyPI:
 
 ```bash
-python -m pip install .
+python -m pip install darkformer-pytorch
 ```
 
-For development:
+For development, install from the repository root:
 
 ```bash
 python -m pip install -e ".[dev]"
@@ -97,7 +97,7 @@ and GPU environment.
 ```python
 import torch
 
-from darkformer import DarkformerAttention
+from darkformer_pytorch import DarkformerAttention
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -158,7 +158,8 @@ FlashAttention 3 requires an NVIDIA Hopper GPU and CUDA 12.3 or newer.
 FlashAttention 2 requires CUDA 12.0 or newer on supported NVIDIA GPUs, or a
 supported ROCm environment.
 
-Optional FlashAttention packages are never required to import or run `darkformer`.
+Optional FlashAttention packages are never required to import or run
+`darkformer_pytorch`.
 FlashAttention only serves the exact learned-kernel path. The linear positive random
 feature path has no softmax score matrix for a FlashAttention kernel to compute.
 
@@ -170,7 +171,7 @@ option because position handling belongs to the surrounding encoder-decoder mode
 ```python
 import torch
 
-from darkformer import CrossAttention
+from darkformer_pytorch import CrossAttention
 
 cross_attention = CrossAttention(
     dim=512,
@@ -217,7 +218,7 @@ projections reproducible independently of PyTorch's global random state.
 For a scheduled training policy:
 
 ```python
-from darkformer import SelfAttention
+from darkformer_pytorch import SelfAttention
 
 attention = SelfAttention(
     512,
@@ -252,7 +253,7 @@ embeddings. Use `cross_attend=True` to add a context-attention sublayer.
 ```python
 import torch
 
-from darkformer import Darkformer
+from darkformer_pytorch import Darkformer
 
 encoder = Darkformer(
     dim=512,
@@ -292,7 +293,7 @@ output = decoder(
 ```python
 import torch
 
-from darkformer import DarkformerLM
+from darkformer_pytorch import DarkformerLM
 
 model = DarkformerLM(
     vocab_size=32_000,
@@ -324,7 +325,7 @@ projection. `encoder_depth` and `decoder_depth` can override the common `depth`.
 ```python
 import torch
 
-from darkformer import DarkformerEncDec
+from darkformer_pytorch import DarkformerEncDec
 
 model = DarkformerEncDec(
     source_vocab_size=32_000,

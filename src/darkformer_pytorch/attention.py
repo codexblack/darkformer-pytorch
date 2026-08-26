@@ -9,8 +9,8 @@ from typing import Literal
 import torch
 from torch import nn
 
-from darkformer.backends import AttentionBackend, exact_attention
-from darkformer.random_features import DataAwareRandomFeatures
+from darkformer_pytorch.backends import AttentionBackend, exact_attention
+from darkformer_pytorch.random_features import DataAwareRandomFeatures
 
 AttentionMode = Literal["linear", "auto", "exact"]
 

@@ -3,8 +3,8 @@
 import pytest
 import torch
 
-import darkformer.attention as attention_module
-from darkformer.attention import (
+import darkformer_pytorch.attention as attention_module
+from darkformer_pytorch.attention import (
     CrossAttention,
     DarkformerKernelAttention,
     RotaryEmbedding,

@@ -10,14 +10,14 @@ import torch
 from torch import nn
 from torch.nn import functional
 
-from darkformer.attention import (
+from darkformer_pytorch.attention import (
     AttentionMode,
     CausalAttentionState,
     ContextAttentionState,
     CrossAttention,
     SelfAttention,
 )
-from darkformer.backends import AttentionBackend
+from darkformer_pytorch.backends import AttentionBackend
 
 
 @dataclass(slots=True)

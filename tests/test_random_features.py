@@ -4,7 +4,7 @@ import math
 
 import torch
 
-from darkformer.random_features import DataAwareRandomFeatures
+from darkformer_pytorch.random_features import DataAwareRandomFeatures
 
 
 def test_identity_covariance_initialization() -> None:

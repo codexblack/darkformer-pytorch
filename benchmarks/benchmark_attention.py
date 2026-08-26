@@ -9,7 +9,7 @@ from typing import Literal, cast
 
 import torch
 
-from darkformer import DarkformerAttention
+from darkformer_pytorch import DarkformerAttention
 
 AttentionMode = Literal["linear", "exact", "auto"]
 DtypeName = Literal["auto", "float32", "float16", "bfloat16"]

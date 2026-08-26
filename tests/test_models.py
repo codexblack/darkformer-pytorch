@@ -7,9 +7,9 @@ import pytest
 import torch
 from torch import nn
 
-from darkformer.attention import AttentionMode
-from darkformer.model import DarkformerBlock, DarkformerEncDec, DarkformerLM
-from darkformer.random_features import DataAwareRandomFeatures
+from darkformer_pytorch.attention import AttentionMode
+from darkformer_pytorch.model import DarkformerBlock, DarkformerEncDec, DarkformerLM
+from darkformer_pytorch.random_features import DataAwareRandomFeatures
 
 ProjectionModel = DarkformerLM | DarkformerEncDec
 
@@ -404,7 +404,9 @@ def test_generation_slices_buffer_after_eos() -> None:
     prompt = torch.tensor([[1, 4], [2, 5]], dtype=torch.long)
     next_token = torch.full((2, 1), 3, dtype=torch.long)
 
-    with mock.patch("darkformer.model._sample_next_token", return_value=next_token):
+    with mock.patch(
+        "darkformer_pytorch.model._sample_next_token", return_value=next_token
+    ):
         generated = model.generate(
             prompt,
             max_new_tokens=4,

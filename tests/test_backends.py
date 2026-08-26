@@ -8,7 +8,7 @@ from typing import cast
 import pytest
 import torch
 
-from darkformer import backends
+from darkformer_pytorch import backends
 
 
 def _reference_attention(

@@ -1,6 +1,6 @@
 """DARKformer for PyTorch."""
 
-from darkformer.attention import (
+from darkformer_pytorch.attention import (
     AttentionMode,
     CausalAttentionState,
     ContextAttentionState,
@@ -9,8 +9,8 @@ from darkformer.attention import (
     DarkformerKernelAttention,
     SelfAttention,
 )
-from darkformer.backends import AttentionBackend
-from darkformer.model import (
+from darkformer_pytorch.backends import AttentionBackend
+from darkformer_pytorch.model import (
     Darkformer,
     DarkformerBlock,
     DarkformerEncDec,
@@ -18,7 +18,7 @@ from darkformer.model import (
     DarkformerLM,
     DarkformerState,
 )
-from darkformer.random_features import DataAwareRandomFeatures
+from darkformer_pytorch.random_features import DataAwareRandomFeatures
 
 __version__ = "0.1.0"
 

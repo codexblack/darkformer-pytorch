@@ -3,15 +3,18 @@ requires = ["hatchling>=1.26"]
 build-backend = "hatchling.build"
 
 [project]
-name = "darkformer"
+name = "darkformer-pytorch"
 dynamic = ["version"]
 description = "Data-aware random feature attention for PyTorch"
 readme = "README.md"
 requires-python = ">=3.10"
+license = "MIT"
+license-files = ["LICENSE"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Intended Audience :: Developers",
   "Intended Audience :: Science/Research",
+  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
@@ -36,10 +39,13 @@ dev = [
 ]
 
 [project.urls]
+Homepage = "https://github.com/codexblack/darkformer-pytorch"
+Issues = "https://github.com/codexblack/darkformer-pytorch/issues"
 Paper = "https://arxiv.org/abs/2603.04127"
+Repository = "https://github.com/codexblack/darkformer-pytorch"
 
 [tool.hatch.version]
-path = "src/darkformer/__init__.py"
+path = "src/darkformer_pytorch/__init__.py"
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -47,12 +53,13 @@ include = [
   "/tests",
   "/benchmarks",
   "/README.md",
+  "/LICENSE",
   "/photo.png",
   "/pyproject.toml",
 ]
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/darkformer"]
+packages = ["src/darkformer_pytorch"]
 
 [tool.ruff]
 line-length = 88
@@ -82,7 +89,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["darkformer"]
+known-first-party = ["darkformer_pytorch"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"
@@ -102,14 +109,14 @@ minversion = "8.0"
 addopts = [
   "--strict-config",
   "--strict-markers",
-  "--cov=darkformer",
+  "--cov=darkformer_pytorch",
   "--cov-report=term-missing:skip-covered",
 ]
 testpaths = ["tests"]
 
 [tool.coverage.run]
 branch = true
-source = ["darkformer"]
+source = ["darkformer_pytorch"]
 
 [tool.coverage.report]
 exclude_also = [
