@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "darkformer"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Data-aware random feature attention for PyTorch"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -25,14 +25,19 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = [
+  "build>=1.2",
   "mypy>=1.10",
   "pytest>=8.0",
   "pytest-cov>=5.0",
   "ruff>=0.6",
+  "twine>=5.1",
 ]
 
 [project.urls]
 Paper = "https://arxiv.org/abs/2603.04127"
+
+[tool.hatch.version]
+path = "src/darkformer/__init__.py"
 
 [tool.hatch.build.targets.sdist]
 include = [
@@ -40,6 +45,7 @@ include = [
   "/tests",
   "/benchmarks",
   "/README.md",
+  "/photo.png",
   "/pyproject.toml",
 ]
 
@@ -114,9 +120,10 @@ show_missing = true
 python_version = "3.10"
 files = ["src", "tests", "benchmarks"]
 strict = true
+warn_return_any = false
 warn_unreachable = true
 warn_unused_configs = true
 
 [[tool.mypy.overrides]]
-module = ["flash_attn", "flash_attn.*", "flash_attn_3", "flash_attn_3.*"]
+module = ["flash_attn", "flash_attn_3"]
 ignore_missing_imports = true
