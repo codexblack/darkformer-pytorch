@@ -50,7 +50,7 @@ The finite feature map approximates the learned kernel, and normalized attention
 can be evaluated associatively:
 
 ```math
-\operatorname{Att}(Q, K, V)
+\mathrm{Att}(Q, K, V)
 \approx
 \frac{
   \Phi(Q)\left(\Phi(K)^\mathsf{T} V\right)
