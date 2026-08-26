@@ -2,6 +2,8 @@
 
 # Data-Aware Random Feature Kernels for Transformers (DARKformer)
 
+[![PyPI version](https://badge.fury.io/py/darkformer.svg)](https://badge.fury.io/py/darkformer)
+
 The `darkformer` package provides a PyTorch implementation of the data-aware random feature
 kernel described in the [Data-Aware Random Feature Kernel for
 Transformers](https://arxiv.org/abs/2603.04127) paper by Google Deepmind. It follows the positive random
@@ -19,6 +21,14 @@ For each attention head, DARKformer replaces the usual dot-product kernel with:
 \Sigma &= M^\mathsf{T} M \succeq 0, \\
 \kappa_\Sigma(q, k) &= \exp\!\left(q^\mathsf{T} \Sigma k\right).
 \end{aligned}
+```
+
+The public attention modules apply $d_h^{-1/4}$ to both queries and keys. For
+unscaled inputs, the evaluated kernel is therefore
+
+```math
+\kappa_\Sigma(q, k)
+= \exp\!\left(\frac{q^\mathsf{T}\Sigma k}{\sqrt{d_h}}\right).
 ```
 
 The factorization keeps $\Sigma$ positive semidefinite. For $m$ features with each
@@ -74,8 +84,9 @@ For development:
 python -m pip install -e ".[dev]"
 ```
 
-PyTorch is the only runtime dependency. FlashAttention is optional and should be
-installed separately for a compatible CUDA, PyTorch, and GPU environment.
+PyTorch is the only runtime dependency. [FlashAttention](https://github.com/Dao-AILab/flash-attention)
+is optional and should be installed separately for a compatible CUDA, PyTorch,
+and GPU environment.
 
 ## Self-attention
 
@@ -141,6 +152,10 @@ dimension, dropout, causality, and mask. It otherwise uses PyTorch scaled dot-pr
 attention. Set `exact_backend` to `"flash3"`, `"flash2"`, or `"sdpa"` to request a
 specific backend. A forced FlashAttention backend raises an error when its package or
 required hardware support is unavailable.
+
+FlashAttention 3 requires an NVIDIA Hopper GPU and CUDA 12.3 or newer.
+FlashAttention 2 requires CUDA 12.0 or newer on supported NVIDIA GPUs, or a
+supported ROCm environment.
 
 Optional FlashAttention packages are never required to import or run `darkformer`.
 FlashAttention only serves the exact learned-kernel path. The linear positive random
@@ -224,7 +239,7 @@ with torch.autocast("cuda", dtype=torch.bfloat16):
     output = attention(x, mask=mask)
 ```
 
-We generally prefer`bfloat16` where supported because of its wider exponent
+We generally prefer `bfloat16` where supported because of its wider exponent
 range. Numerically sensitive feature normalization and reductions use stable
 accumulation before results are returned in the model dtype.
 
@@ -356,6 +371,19 @@ generated = model.generate(
     top_k=50,
 )
 ```
+
+With `attention_mode="linear"`, generation processes the prompt once and then
+updates recurrent self-attention statistics for each appended token. Decoder
+cross-attention projects and summarizes the encoded source once per layer.
+`"auto"` and `"exact"` modes retain full-prefix decoding because their exact path
+requires a conventional key-value cache.
+
+The recurrent APIs are also available directly through
+`forward_with_state(...)` on `SelfAttention`, `Darkformer`, and `DarkformerLM`,
+and through `decode_with_state(...)` on `DarkformerEncDec`. Cached states are
+append-only and tied to the model parameters, device, dtype, masks, and random
+projection matrices used to create them. Discard a state after changing any of
+those inputs. A projection redraw is detected and rejected automatically.
 
 ## Benchmark
 
