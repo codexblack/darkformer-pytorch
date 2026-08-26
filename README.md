@@ -1,39 +1,59 @@
-# DARKformer
+<img src="./photo.png" width="500px"></img>
 
-`darkformer` provides a PyTorch implementation of the data-aware random feature
-kernel described in [Data-Aware Random Feature Kernel for
-Transformers](https://arxiv.org/abs/2603.04127). It follows the positive random
+# Data-Aware Random Feature Kernels for Transformers (DARKformer)
+
+The `darkformer` package provides a PyTorch implementation of the data-aware random feature
+kernel described in the [Data-Aware Random Feature Kernel for
+Transformers](https://arxiv.org/abs/2603.04127) paper by Google Deepmind. It follows the positive random
 feature formulation used by Performer while learning the projection geometry from
 data.
 
+Inspiration was taken from lucidrain's [performer-pytorch](https://github.com/lucidrains/performer-pytorch) package to guide the implementation.
+
 ## Kernel
 
-For each attention head, DARKformer replaces the usual dot-product kernel with
+For each attention head, DARKformer replaces the usual dot-product kernel with:
 
-```text
-k(q, k) = exp(q^T Sigma k),       Sigma = M^T M.
+```math
+\begin{aligned}
+\Sigma &= M^\mathsf{T} M \succeq 0, \\
+\kappa_\Sigma(q, k) &= \exp\!\left(q^\mathsf{T} \Sigma k\right).
+\end{aligned}
 ```
 
-The factorization keeps `Sigma` positive semidefinite. With `omega` sampled from a
-standard Gaussian, the corresponding positive random feature map is
+The factorization keeps $\Sigma$ positive semidefinite. For $m$ features with each
+$\omega_j$ sampled from a standard Gaussian, the corresponding positive random
+feature map is
 
-```text
-phi(x; omega) = exp(omega^T M x - 0.5 ||M x||^2).
+```math
+\phi_\Sigma(x; \omega_j)
+= \frac{1}{\sqrt{m}}
+  \exp\!\left(
+    \omega_j^\mathsf{T} Mx
+    - \frac{1}{2} x^\mathsf{T} \Sigma x
+  \right),
+\qquad
+\omega_j \sim \mathcal{N}(0, I).
 ```
 
 The finite feature map approximates the learned kernel, and normalized attention
 can be evaluated associatively:
 
-```text
-phi(Q) (phi(K)^T V)
---------------------
-phi(Q) (phi(K)^T 1)
+```math
+\operatorname{Att}(Q, K, V)
+\approx
+\frac{
+  \Phi(Q)\left(\Phi(K)^\mathsf{T} V\right)
+}{
+  \Phi(Q)\left(\Phi(K)^\mathsf{T} \mathbf{1}\right)
+}.
 ```
 
-This ordering does not construct the sequence-by-sequence score matrix. Its cost is
-linear in sequence length and in the random feature count. Learning `M` aligns the
-sampling covariance with the query-key geometry, which the paper interprets as an
-implicit importance-sampling scheme for reducing Monte Carlo variance.
+For sequence length $L$, head dimension $d_h$, and $m$ random features, this ordering
+costs $O(L m d_h)$ per head and does not construct the $L \times L$ score matrix.
+Exact attention costs $O(L^2 d_h)$. Learning $M$ aligns the sampling covariance with
+the query-key geometry, which the paper interprets as an implicit
+importance-sampling scheme for reducing Monte Carlo variance.
 
 The learned positive semidefinite kernel and its positive random feature estimator
 come from the paper. Runtime mode selection, feature count, redraw timing, exact
@@ -84,9 +104,9 @@ mask = torch.ones(2, 2048, dtype=torch.bool, device=device)
 output = attention(x, mask=mask)
 ```
 
-The input and output shapes are `(batch, sequence, dim)`. A boolean `mask` has shape
-`(batch, sequence)`, where `True` marks a valid token. Causal attention combines the
-token mask with the causal constraint.
+The input and output shapes are $B \times L \times d$. A boolean `mask` has shape
+$B \times L$, where `True` marks a valid token. Causal attention combines the token
+mask with the causal constraint.
 
 Set `per_head_geometry=False` to share the learned geometry across heads. Set
 `orthogonal_features=False` to use independent Gaussian features instead of
@@ -204,7 +224,7 @@ with torch.autocast("cuda", dtype=torch.bfloat16):
     output = attention(x, mask=mask)
 ```
 
-`bfloat16` is generally preferable where supported because of its wider exponent
+We generally prefer`bfloat16` where supported because of its wider exponent
 range. Numerically sensitive feature normalization and reductions use stable
 accumulation before results are returned in the model dtype.
 
@@ -276,9 +296,9 @@ logits = model(tokens, mask=mask)
 model.redraw_projection_matrices_()
 ```
 
-The returned logits have shape `(batch, sequence, vocab_size)`. `max_seq_len` is an
-optional input validation limit. `DarkformerLM` uses rotary position information
-rather than learned absolute position embeddings by default.
+The returned logits have shape $B \times L \times V$, where $V$ is `vocab_size`.
+`max_seq_len` is an optional input validation limit. `DarkformerLM` uses rotary
+position information rather than learned absolute position embeddings by default.
 
 ## Encoder-decoder model and generation
 
@@ -352,10 +372,24 @@ configure sequence lengths, feature count, model dimensions, masks, warmup, and
 measurement iterations.
 
 ## References
-
-- Amirhossein Farzam, Hossein Mobahi, Nolan Andrew Miller, and Luke Sernau.
-  [Data-Aware Random Feature Kernel for
-  Transformers](https://arxiv.org/abs/2603.04127), 2026.
-- The [performer-pytorch](https://github.com/lucidrains/performer-pytorch)
-  implementation is a useful reference for positive random feature attention and
-  projection redraw behavior.
+```bibtex
+ @misc{farzam2026dataawarerandomfeaturekernel,
+      title={Data-Aware Random Feature Kernel for Transformers}, 
+      author={Amirhossein Farzam and Hossein Mobahi and Nolan Andrew Miller and Luke Sernau},
+      year={2026},
+      eprint={2603.04127},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2603.04127}, 
+}
+```
+```bibtex
+@misc{choromanski2020rethinking,
+    title   = {Rethinking Attention with Performers},
+    author  = {Krzysztof Choromanski and Valerii Likhosherstov and David Dohan and Xingyou Song and Andreea Gane and Tamas Sarlos and Peter Hawkins and Jared Davis and Afroz Mohiuddin and Lukasz Kaiser and David Belanger and Lucy Colwell and Adrian Weller},
+    year    = {2020},
+    eprint  = {2009.14794},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG}
+}
+```
