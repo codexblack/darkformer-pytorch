@@ -321,7 +321,7 @@ def test_encoder_decoder_recurrent_logits_match_full_decode() -> None:
     assert all(layer.cross_attention is not None for layer in state.layers)
 
 
-def test_cached_language_generation_matches_full_prefix_and_projects_chunks() -> None:
+def test_cached_language_generation_uses_chunk_projections() -> None:
     model = _language_model(rotary=True)
     prompt = torch.tensor([[1, 4], [2, 5]], dtype=torch.long)
     expected = _full_prefix_language_generation(model, prompt, 3)
@@ -339,7 +339,7 @@ def test_cached_language_generation_matches_full_prefix_and_projects_chunks() ->
     assert projected_lengths == [2, 1, 1]
 
 
-def test_cached_encoder_decoder_generation_projects_context_once_per_layer() -> None:
+def test_cached_encdec_generation_projects_context_once() -> None:
     model = _encoder_decoder(depth=2, rotary=True)
     source_tokens = torch.tensor(
         [[1, 3, 5, 0], [2, 4, 6, 7]],
@@ -397,6 +397,22 @@ def test_generation_falls_back_for_exact_attention() -> None:
         generated = model.generate(prompt, max_new_tokens=2, top_k=1)
 
     assert generated.shape == (1, 4)
+
+
+def test_generation_slices_buffer_after_eos() -> None:
+    model = _language_model()
+    prompt = torch.tensor([[1, 4], [2, 5]], dtype=torch.long)
+    next_token = torch.full((2, 1), 3, dtype=torch.long)
+
+    with mock.patch("darkformer.model._sample_next_token", return_value=next_token):
+        generated = model.generate(
+            prompt,
+            max_new_tokens=4,
+            eos_token_id=3,
+        )
+
+    assert generated.shape == (2, 3)
+    assert torch.equal(generated[:, -1], next_token[:, 0])
 
 
 def test_generation_preflights_prompt_and_length() -> None:

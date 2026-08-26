@@ -228,23 +228,23 @@ class DataAwareRandomFeatures(nn.Module):
 
     def _validate_data(self, data: torch.Tensor) -> None:
         if data.ndim != 4:
-            raise ValueError(
-                "data must have shape [batch, heads, length, head_dim]"
-            )
+            raise ValueError("data must have shape [batch, heads, length, head_dim]")
         if data.shape[1] != self.num_heads or data.shape[-1] != self.head_dim:
             raise ValueError(
-                f"data must have {self.num_heads} heads and head_dim "
-                f"{self.head_dim}"
+                f"data must have {self.num_heads} heads and head_dim {self.head_dim}"
             )
 
     def feature_logits(self, data: torch.Tensor) -> torch.Tensor:
         """Return unnormalized log positive features."""
         self._validate_data(data)
+
+        return self._feature_logits(data)
+
+    def _feature_logits(self, data: torch.Tensor) -> torch.Tensor:
         scaled_data = data * (self.head_dim**-0.25)
-        transformed = torch.einsum(
-            "bhnd,hrd->bhnr",
+        transformed = torch.matmul(
             scaled_data,
-            self._geometry_for_heads(),
+            self._geometry_for_heads().transpose(-1, -2),
         )
         projected = torch.matmul(
             transformed,
@@ -270,7 +270,7 @@ class DataAwareRandomFeatures(nn.Module):
         mask: torch.Tensor | None,
         stabilize: bool,
     ) -> torch.Tensor:
-        logits = self.feature_logits(data)
+        logits = self._feature_logits(data)
 
         if stabilize:
             if is_query:
@@ -301,6 +301,7 @@ class DataAwareRandomFeatures(nn.Module):
         stabilize: bool = True,
     ) -> torch.Tensor:
         """Map queries into the learned random-feature space."""
+        self._validate_data(query)
         return self._feature_map(
             query,
             is_query=True,
@@ -342,10 +343,16 @@ class DataAwareRandomFeatures(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Map queries and keys into the learned random-feature space."""
         self._validate_inputs(query, key, key_mask)
-        query_features = self.query_feature_map(query, stabilize=stabilize)
-        key_features = self.key_feature_map(
+        query_features = self._feature_map(
+            query,
+            is_query=True,
+            mask=None,
+            stabilize=stabilize,
+        )
+        key_features = self._feature_map(
             key,
-            key_mask=key_mask,
+            is_query=False,
+            mask=key_mask,
             stabilize=stabilize,
         )
         return query_features, key_features

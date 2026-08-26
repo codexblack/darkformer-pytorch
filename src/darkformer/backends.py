@@ -16,6 +16,17 @@ _FlashAttention = Callable[..., torch.Tensor]
 _FLASH_DTYPES = (torch.float16, torch.bfloat16)
 
 
+def _cuda_version_at_least(major: int, minor: int) -> bool:
+    version = torch.version.cuda
+    if version is None:
+        return False
+    try:
+        installed_major, installed_minor = version.split(".")[:2]
+        return (int(installed_major), int(installed_minor)) >= (major, minor)
+    except ValueError:
+        return False
+
+
 @lru_cache(maxsize=1)
 def _load_flash3() -> tuple[_FlashAttention | None, Exception | None]:
     try:
@@ -45,12 +56,14 @@ def _flash3_unavailable_reason(
 ) -> str | None:
     if deterministic:
         return "deterministic execution is unsupported"
-    if query_mask is not None or key_mask is not None:
+    if key_mask is not None:
         return "padding masks are unsupported"
     if dropout_p != 0.0:
         return "attention dropout is unsupported"
     if query.device.type != "cuda" or torch.version.hip is not None:
         return "a CUDA device with compute capability 9.0 is required"
+    if not _cuda_version_at_least(12, 3):
+        return "CUDA 12.3 or newer is required"
     if torch.cuda.get_device_capability(query.device) != (9, 0):
         return "a CUDA device with compute capability 9.0 is required"
     if query.dtype not in _FLASH_DTYPES:
@@ -74,6 +87,8 @@ def _flash2_unavailable_reason(
     if query.device.type != "cuda":
         return "a supported CUDA or ROCm device is required"
     if torch.version.hip is None:
+        if not _cuda_version_at_least(12, 0):
+            return "CUDA 12.0 or newer is required"
         major, _ = torch.cuda.get_device_capability(query.device)
         if major not in (8, 9):
             return "an NVIDIA Ampere, Ada, or Hopper GPU is required"
@@ -85,7 +100,7 @@ def _flash2_unavailable_reason(
         return "query, key, and value head dimensions must match"
     if query.shape[-1] > 256:
         return "head dimensions greater than 256 are unsupported"
-    if query_mask is not None or key_mask is not None:
+    if key_mask is not None:
         return "padding masks are unsupported"
     return None
 
@@ -130,6 +145,8 @@ def _validate_inputs(
         raise ValueError("query, key, and value batch and head dimensions must match")
     if key.shape[2] != value.shape[2]:
         raise ValueError("key and value length dimensions must match")
+    if query.shape[2] < 1 or key.shape[2] < 1:
+        raise ValueError("query and key lengths must be positive")
     if query.shape[-1] != key.shape[-1]:
         raise ValueError("query and key head dimensions must match")
     if causal and query.shape[2] != key.shape[2]:
@@ -238,8 +255,13 @@ def _run_sdpa(
 ) -> torch.Tensor:
     attention_mask = None
     use_causal_flag = causal
+    valid_key_rows = None
     if key_mask is not None:
-        attention_mask = key_mask[:, None, None, :]
+        valid_key_rows = key_mask.any(dim=-1)
+        first_key = torch.zeros_like(key_mask)
+        first_key[:, 0] = True
+        safe_key_mask = key_mask | (~valid_key_rows[:, None] & first_key)
+        attention_mask = safe_key_mask[:, None, None, :]
         if causal:
             query_length = query.shape[2]
             key_length = key.shape[2]
@@ -263,6 +285,8 @@ def _run_sdpa(
         )
     if query_mask is not None:
         output = output.masked_fill(~query_mask[:, None, :, None], 0.0)
+    if valid_key_rows is not None:
+        output = output.masked_fill(~valid_key_rows[:, None, None, None], 0.0)
     return output
 
 
@@ -330,6 +354,9 @@ def exact_attention(
         backend,
         scale,
     )
+    dispatch_key_mask = key_mask
+    if key_mask is not None and bool(key_mask.all()):
+        dispatch_key_mask = None
 
     if backend in ("auto", "flash3"):
         flash3_reason = _flash3_unavailable_reason(
@@ -337,14 +364,20 @@ def exact_attention(
             key,
             value,
             query_mask,
-            key_mask,
+            dispatch_key_mask,
             dropout_p,
             deterministic,
         )
         if flash3_reason is None:
             flash3, import_error = _load_flash3()
             if flash3 is not None:
-                return _run_flash3(flash3, query, key, value, causal, scale)
+                output = _run_flash3(flash3, query, key, value, causal, scale)
+                if query_mask is not None:
+                    output = output.masked_fill(
+                        ~query_mask[:, None, :, None],
+                        0.0,
+                    )
+                return output
             if backend == "flash3":
                 raise _unavailable_error("FlashAttention 3", None, import_error)
         elif backend == "flash3":
@@ -352,12 +385,16 @@ def exact_attention(
 
     if backend in ("auto", "flash2"):
         flash2_reason = _flash2_unavailable_reason(
-            query, key, value, query_mask, key_mask
+            query,
+            key,
+            value,
+            query_mask,
+            dispatch_key_mask,
         )
         if flash2_reason is None:
             flash2, import_error = _load_flash2()
             if flash2 is not None:
-                return _run_flash2(
+                output = _run_flash2(
                     flash2,
                     query,
                     key,
@@ -367,6 +404,12 @@ def exact_attention(
                     scale,
                     deterministic,
                 )
+                if query_mask is not None:
+                    output = output.masked_fill(
+                        ~query_mask[:, None, :, None],
+                        0.0,
+                    )
+                return output
             if backend == "flash2":
                 raise _unavailable_error("FlashAttention 2", None, import_error)
         elif backend == "flash2":
@@ -378,7 +421,7 @@ def exact_attention(
         value,
         causal,
         query_mask,
-        key_mask,
+        dispatch_key_mask,
         dropout_p,
         scale,
         deterministic,

@@ -135,6 +135,29 @@ def test_sdpa_supports_masked_cross_attention() -> None:
     torch.testing.assert_close(actual, expected)
 
 
+def test_sdpa_returns_zero_when_every_key_is_masked() -> None:
+    query = torch.randn(2, 2, 3, 4)
+    key = torch.randn(2, 2, 5, 4)
+    value = torch.randn(2, 2, 5, 6)
+    key_mask = torch.tensor(
+        [[False, False, False, False, False], [True, False, True, False, True]]
+    )
+
+    output = backends.exact_attention(
+        query,
+        key,
+        value,
+        causal=False,
+        key_mask=key_mask,
+        dropout_p=0.0,
+        backend="sdpa",
+    )
+
+    assert torch.all(torch.isfinite(output))
+    assert torch.count_nonzero(output[0]) == 0
+    assert torch.count_nonzero(output[1]) > 0
+
+
 def test_sdpa_deterministic_uses_math_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -235,11 +258,15 @@ def test_auto_prefers_flash3_and_converts_layout(
         lambda: pytest.fail("FlashAttention 2 should not be loaded"),
     )
 
+    query_mask = torch.tensor(
+        [[True, True, True, True, False], [True, True, True, True, True]]
+    )
     output = backends.exact_attention(
         query,
         key,
         value,
         causal=True,
+        query_mask=query_mask,
         dropout_p=0.0,
         scale=0.25,
     )
@@ -253,7 +280,77 @@ def test_auto_prefers_flash3_and_converts_layout(
             True,
         ),
     ]
+    expected = value.masked_fill(~query_mask[:, None, :, None], 0.0)
+    torch.testing.assert_close(output, expected)
+
+
+def test_auto_ignores_an_all_true_key_mask_for_flash_dispatch(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    query = torch.randn(1, 2, 3, 4)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    key_mask = torch.ones(1, 3, dtype=torch.bool)
+    received_masks: list[torch.Tensor | None] = []
+
+    def availability(
+        _query: torch.Tensor,
+        _key: torch.Tensor,
+        _value: torch.Tensor,
+        _query_mask: torch.Tensor | None,
+        dispatched_key_mask: torch.Tensor | None,
+        _dropout_p: float,
+        _deterministic: bool,
+    ) -> None:
+        received_masks.append(dispatched_key_mask)
+
+    def fake_flash3(
+        _query: torch.Tensor,
+        _key: torch.Tensor,
+        flash_value: torch.Tensor,
+        *,
+        softmax_scale: float,
+        causal: bool,
+    ) -> torch.Tensor:
+        del softmax_scale, causal
+        return flash_value
+
+    monkeypatch.setattr(backends, "_flash3_unavailable_reason", availability)
+    monkeypatch.setattr(backends, "_load_flash3", lambda: (fake_flash3, None))
+
+    output = backends.exact_attention(
+        query,
+        key,
+        value,
+        causal=False,
+        key_mask=key_mask,
+        dropout_p=0.0,
+    )
+
+    assert received_masks == [None]
     torch.testing.assert_close(output, value)
+
+
+@pytest.mark.parametrize(
+    ("version", "minimum", "expected"),
+    [
+        ("11.8", (12, 0), False),
+        ("12.0", (12, 0), True),
+        ("12.2", (12, 3), False),
+        ("12.3", (12, 3), True),
+        ("13.0", (12, 3), True),
+        (None, (12, 0), False),
+    ],
+)
+def test_cuda_version_requirement(
+    monkeypatch: pytest.MonkeyPatch,
+    version: str | None,
+    minimum: tuple[int, int],
+    expected: bool,
+) -> None:
+    monkeypatch.setattr(torch.version, "cuda", version)
+
+    assert backends._cuda_version_at_least(*minimum) is expected
 
 
 def test_auto_skips_flash3_deterministic_and_uses_flash2(

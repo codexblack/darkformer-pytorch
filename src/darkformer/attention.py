@@ -15,7 +15,7 @@ from darkformer.random_features import DataAwareRandomFeatures
 AttentionMode = Literal["linear", "auto", "exact"]
 
 
-@dataclass
+@dataclass(slots=True)
 class CausalAttentionState:
     """Recurrent state for causal linear attention."""
 
@@ -26,7 +26,7 @@ class CausalAttentionState:
     projection_version: int
 
 
-@dataclass
+@dataclass(slots=True)
 class ContextAttentionState:
     """Precomputed state for noncausal linear attention."""
 
@@ -58,12 +58,22 @@ def _validate_mask(
         raise ValueError(f"{name} must have shape {(batch_size, length)}")
 
 
+def _normalize_attention(
+    numerator: torch.Tensor,
+    denominator: torch.Tensor,
+) -> torch.Tensor:
+    valid = denominator > 0.0
+    output = numerator / torch.where(valid, denominator, 1.0)[..., None]
+    return torch.where(valid[..., None], output, 0.0)
+
+
 class RotaryEmbedding(nn.Module):
     """Rotary position embedding for query and key tensors."""
 
     cosine_cache: torch.Tensor
-    inverse_frequency: torch.Tensor
+    frequency_indices: torch.Tensor
     sine_cache: torch.Tensor
+    _cache_dtype: torch.dtype | None
 
     def __init__(self, head_dim: int, base: float = 10_000.0) -> None:
         super().__init__()
@@ -72,14 +82,14 @@ class RotaryEmbedding(nn.Module):
             raise ValueError("rotary embeddings require head_dim >= 2")
         if base <= 0.0 or not math.isfinite(base):
             raise ValueError("rotary base must be finite and positive")
-        inverse_frequency = 1.0 / (
-            base ** (torch.arange(0, rotary_dim, 2, dtype=torch.float32) / rotary_dim)
-        )
+        frequency_indices = torch.arange(0, rotary_dim, 2, dtype=torch.long)
+        self.base = float(base)
         self.head_dim = head_dim
         self.rotary_dim = rotary_dim
+        self._cache_dtype = None
         self.register_buffer(
-            "inverse_frequency",
-            inverse_frequency,
+            "frequency_indices",
+            frequency_indices,
             persistent=False,
         )
         self.register_buffer(
@@ -104,20 +114,34 @@ class RotaryEmbedding(nn.Module):
         cache_is_valid = (
             self.cosine_cache.device == tensor.device
             and self.cosine_cache.dtype == tensor.dtype
+            and self._cache_dtype == tensor.dtype
             and self.cosine_cache.shape[0] >= required_length
         )
         if not cache_is_valid:
+            current_length = (
+                self.cosine_cache.shape[0]
+                if self.cosine_cache.device == tensor.device
+                and self.cosine_cache.dtype == tensor.dtype
+                and self._cache_dtype == tensor.dtype
+                else 0
+            )
+            cache_length = max(required_length, max(16, 2 * current_length))
             positions = torch.arange(
-                required_length,
+                cache_length,
                 device=tensor.device,
                 dtype=torch.float32,
             )
-            angles = torch.outer(
-                positions,
-                self.inverse_frequency.to(device=tensor.device, dtype=torch.float32),
+            inverse_frequency = self.base ** (
+                -self.frequency_indices.to(
+                    device=tensor.device,
+                    dtype=torch.float32,
+                )
+                / self.rotary_dim
             )
+            angles = torch.outer(positions, inverse_frequency)
             self.cosine_cache = angles.cos().to(tensor.dtype)
             self.sine_cache = angles.sin().to(tensor.dtype)
+            self._cache_dtype = tensor.dtype
         cosine = self.cosine_cache[offset:required_length][None, None, :, :]
         sine = self.sine_cache[offset:required_length][None, None, :, :]
         return cosine, sine
@@ -138,10 +162,6 @@ class RotaryEmbedding(nn.Module):
         if remainder.shape[-1] == 0:
             return rotated
         return torch.cat((rotated, remainder), dim=-1)
-
-    def _apply_rotary(self, tensor: torch.Tensor, offset: int = 0) -> torch.Tensor:
-        cosine, sine = self._rotary_values(tensor, offset)
-        return self._apply_with_values(tensor, cosine, sine)
 
     def forward(
         self,
@@ -171,6 +191,7 @@ class DarkformerKernelAttention(nn.Module):
 
     _calls_since_redraw: torch.Tensor
     _redraw_count: torch.Tensor
+    _redraw_seed: torch.Tensor
     _projection_version: int
     random_features: DataAwareRandomFeatures
 
@@ -242,6 +263,12 @@ class DarkformerKernelAttention(nn.Module):
             torch.zeros((), dtype=torch.long),
             persistent=True,
         )
+        redraw_seed = (
+            torch.randint(0, 2**31 - 1, (), dtype=torch.long)
+            if projection_seed is None
+            else torch.tensor(projection_seed % (2**63 - 1), dtype=torch.long)
+        )
+        self.register_buffer("_redraw_seed", redraw_seed, persistent=True)
 
     @property
     def geometry(self) -> nn.Parameter:
@@ -252,12 +279,11 @@ class DarkformerKernelAttention(nn.Module):
         """Return the attention covariance for every head."""
         return self.random_features.covariance()
 
-    def _redraw_generator(self) -> torch.Generator | None:
-        if self.projection_seed is None:
-            return None
+    def _redraw_generator(self) -> torch.Generator:
         device = self.random_features.projection_matrix.device
         generator = torch.Generator(device=device)
-        generator.manual_seed(self.projection_seed + int(self._redraw_count.item()) + 1)
+        seed = int(self._redraw_seed.item()) + int(self._redraw_count.item()) + 1
+        generator.manual_seed(seed % (2**63 - 1))
         return generator
 
     @torch.no_grad()
@@ -315,15 +341,13 @@ class DarkformerKernelAttention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         geometry = self.random_features._geometry_for_heads()
         normalizer = self.head_dim**-0.25
-        transformed_query = torch.einsum(
-            "bhnd,hrd->bhnr",
+        transformed_query = torch.matmul(
             query * normalizer,
-            geometry,
+            geometry.transpose(-1, -2),
         )
-        transformed_key = torch.einsum(
-            "bhnd,hrd->bhnr",
+        transformed_key = torch.matmul(
             key * normalizer,
-            geometry,
+            geometry.transpose(-1, -2),
         )
         return transformed_query, transformed_key
 
@@ -343,13 +367,7 @@ class DarkformerKernelAttention(nn.Module):
         )
         key_value = torch.matmul(key_features.transpose(-1, -2), value)
         numerator = torch.matmul(query_features, key_value)
-        safe_denominator = torch.where(
-            denominator > 0.0,
-            denominator,
-            1.0,
-        )
-        output = numerator / safe_denominator[..., None]
-        return torch.where(denominator[..., None] > 0.0, output, 0.0)
+        return _normalize_attention(numerator, denominator)
 
     def _validate_key_value(
         self,
@@ -359,9 +377,7 @@ class DarkformerKernelAttention(nn.Module):
     ) -> None:
         for name, tensor in (("key", key), ("value", value)):
             if tensor.ndim != 4:
-                raise ValueError(
-                    f"{name} must have shape [batch, heads, length, dim]"
-                )
+                raise ValueError(f"{name} must have shape [batch, heads, length, dim]")
         if key.shape[:3] != value.shape[:3]:
             raise ValueError("key and value batch, head, and length dimensions differ")
         if key.shape[1] != self.num_heads:
@@ -425,9 +441,7 @@ class DarkformerKernelAttention(nn.Module):
     ) -> tuple[torch.Tensor, CausalAttentionState]:
         query_logits = self.random_features.feature_logits(query)
         key_logits = self.random_features.feature_logits(key)
-        query_maximum = (
-            query_logits.amax(dim=-1, keepdim=True).detach().clamp_min(0.0)
-        )
+        query_maximum = query_logits.amax(dim=-1, keepdim=True).detach().clamp_min(0.0)
         feature_scale = self.num_features**-0.5
         query_features = torch.exp(query_logits - query_maximum)
         query_features = query_features + self.eps * torch.exp(-query_maximum)
@@ -454,13 +468,10 @@ class DarkformerKernelAttention(nn.Module):
             expected_value_shape = (batch, heads, features, value_dim)
             expected_scale_shape = (batch, heads, 1, 1)
             if tuple(state.key_sum.shape) != expected_key_shape:
-                raise ValueError(
-                    f"state.key_sum must have shape {expected_key_shape}"
-                )
+                raise ValueError(f"state.key_sum must have shape {expected_key_shape}")
             if tuple(state.key_value_sum.shape) != expected_value_shape:
                 raise ValueError(
-                    "state.key_value_sum must have shape "
-                    f"{expected_value_shape}"
+                    f"state.key_value_sum must have shape {expected_value_shape}"
                 )
             if tuple(state.key_log_scale.shape) != expected_scale_shape:
                 raise ValueError(
@@ -474,9 +485,7 @@ class DarkformerKernelAttention(nn.Module):
                 if tensor.device != query.device:
                     raise ValueError(f"{name} must be on the same device as query")
                 if tensor.dtype != query_features.dtype:
-                    raise ValueError(
-                        f"{name} must have dtype {query_features.dtype}"
-                    )
+                    raise ValueError(f"{name} must have dtype {query_features.dtype}")
             if state.sequence_length < 0:
                 raise ValueError("state.sequence_length must be nonnegative")
             if state.projection_version != self._projection_version:
@@ -536,30 +545,24 @@ class DarkformerKernelAttention(nn.Module):
                     ~key_mask_chunk[:, None, :, None],
                     0.0,
                 )
-            key_prefix = key_chunk.cumsum(dim=2) + key_state[:, :, None]
-            outer_products = key_chunk[..., None] * value_chunk[..., None, :]
-            key_value_prefix = (
-                outer_products.cumsum(dim=2) + key_value_state[:, :, None]
+            prefix_scores = torch.matmul(
+                query_chunk,
+                key_chunk.transpose(-1, -2),
+            ).tril_()
+            denominator = torch.einsum(
+                "bhnm,bhm->bhn",
+                query_chunk,
+                key_state,
             )
-            denominator = (query_chunk * key_prefix).sum(dim=-1)
-            numerator = torch.matmul(
-                query_chunk.unsqueeze(-2),
-                key_value_prefix,
-            ).squeeze(-2)
-            safe_denominator = torch.where(
-                denominator > 0.0,
-                denominator,
-                1.0,
+            denominator = denominator + prefix_scores.sum(dim=-1)
+            numerator = torch.matmul(query_chunk, key_value_state)
+            numerator = numerator + torch.matmul(prefix_scores, value_chunk)
+            outputs.append(_normalize_attention(numerator, denominator))
+            key_state = key_state + key_chunk.sum(dim=2)
+            key_value_state = key_value_state + torch.matmul(
+                key_chunk.transpose(-1, -2),
+                value_chunk,
             )
-            output_chunk = numerator / safe_denominator[..., None]
-            output_chunk = torch.where(
-                denominator[..., None] > 0.0,
-                output_chunk,
-                0.0,
-            )
-            outputs.append(output_chunk)
-            key_state = key_prefix[:, :, -1]
-            key_value_state = key_value_prefix[:, :, -1]
             if key_mask_chunk is not None:
                 key_logits_chunk = key_logits_chunk.masked_fill(
                     ~key_mask_chunk[:, None, :, None],
@@ -681,9 +684,10 @@ class DarkformerKernelAttention(nn.Module):
         expected_key_shape = (query.shape[0], self.num_heads, self.num_features)
         if tuple(state.key_sum.shape) != expected_key_shape:
             raise ValueError(f"state.key_sum must have shape {expected_key_shape}")
-        if state.key_value_sum.ndim != 4 or tuple(
-            state.key_value_sum.shape[:3]
-        ) != expected_key_shape:
+        if (
+            state.key_value_sum.ndim != 4
+            or tuple(state.key_value_sum.shape[:3]) != expected_key_shape
+        ):
             raise ValueError(
                 "state.key_value_sum must have shape "
                 f"{(*expected_key_shape, 'value_dim')}"
@@ -703,13 +707,7 @@ class DarkformerKernelAttention(nn.Module):
             state.key_sum,
         )
         numerator = torch.matmul(query_features, state.key_value_sum)
-        safe_denominator = torch.where(
-            denominator > 0.0,
-            denominator,
-            1.0,
-        )
-        output = numerator / safe_denominator[..., None]
-        output = torch.where(denominator[..., None] > 0.0, output, 0.0)
+        output = _normalize_attention(numerator, denominator)
         if query_mask is not None:
             output = output.masked_fill(~query_mask[:, None, :, None], 0.0)
         return output.to(query.dtype)
@@ -1027,12 +1025,16 @@ class CrossAttention(nn.Module):
         if inputs.ndim != 3 or inputs.shape[-1] != self.dim:
             raise ValueError(f"inputs must have shape [batch, length, {self.dim}]")
         batch, length, _ = inputs.shape
-        return self.to_query(inputs).reshape(
-            batch,
-            length,
-            self.heads,
-            self.head_dim,
-        ).transpose(1, 2)
+        return (
+            self.to_query(inputs)
+            .reshape(
+                batch,
+                length,
+                self.heads,
+                self.head_dim,
+            )
+            .transpose(1, 2)
+        )
 
     def _project_context(
         self,

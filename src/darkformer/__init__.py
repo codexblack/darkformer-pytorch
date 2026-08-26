@@ -2,6 +2,8 @@
 
 from darkformer.attention import (
     AttentionMode,
+    CausalAttentionState,
+    ContextAttentionState,
     CrossAttention,
     DarkformerAttention,
     DarkformerKernelAttention,
@@ -12,22 +14,28 @@ from darkformer.model import (
     Darkformer,
     DarkformerBlock,
     DarkformerEncDec,
+    DarkformerLayerState,
     DarkformerLM,
+    DarkformerState,
 )
 from darkformer.random_features import DataAwareRandomFeatures
 
 __version__ = "0.1.0"
 
 __all__ = [
-    "CrossAttention",
     "AttentionBackend",
     "AttentionMode",
+    "CausalAttentionState",
+    "ContextAttentionState",
+    "CrossAttention",
     "Darkformer",
     "DarkformerAttention",
     "DarkformerBlock",
     "DarkformerEncDec",
     "DarkformerKernelAttention",
     "DarkformerLM",
+    "DarkformerLayerState",
+    "DarkformerState",
     "DataAwareRandomFeatures",
     "SelfAttention",
     "__version__",

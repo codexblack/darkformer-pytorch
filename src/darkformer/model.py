@@ -20,7 +20,7 @@ from darkformer.attention import (
 from darkformer.backends import AttentionBackend
 
 
-@dataclass
+@dataclass(slots=True)
 class DarkformerLayerState:
     """Recurrent attention state for one transformer layer."""
 
@@ -28,7 +28,7 @@ class DarkformerLayerState:
     cross_attention: ContextAttentionState | None = None
 
 
-@dataclass
+@dataclass(slots=True)
 class DarkformerState:
     """Recurrent attention state for a transformer stack."""
 
@@ -59,6 +59,12 @@ def _sample_next_token(
         threshold = logits.topk(count, dim=-1).values[:, -1, None]
         logits = logits.masked_fill(logits < threshold, -torch.inf)
     return torch.multinomial(logits.softmax(dim=-1), 1)
+
+
+def _generation_buffer(prompt: torch.Tensor, total_length: int) -> torch.Tensor:
+    generated = prompt.new_empty((prompt.shape[0], total_length))
+    generated[:, : prompt.shape[1]].copy_(prompt)
+    return generated
 
 
 class FeedForward(nn.Module):
@@ -163,7 +169,7 @@ class DarkformerBlock(nn.Module):
         context: torch.Tensor | None = None,
         context_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Apply self-attention, optional cross-attention, and feed-forward layers."""
+        """Apply attention and feed-forward layers."""
         inputs = inputs + self.self_attention(self.self_norm(inputs), mask=mask)
         if self.cross_attention is not None:
             if context is None or self.cross_norm is None:
@@ -459,6 +465,8 @@ class DarkformerLM(nn.Module):
     def _validate_tokens(self, tokens: torch.Tensor, name: str) -> None:
         if tokens.ndim != 2 or tokens.dtype not in (torch.int32, torch.int64):
             raise ValueError(f"{name} must be an integer tensor [batch, length]")
+        if tokens.shape[1] < 1:
+            raise ValueError(f"{name} must contain at least one token")
         if self.max_seq_len is not None and tokens.shape[1] > self.max_seq_len:
             raise ValueError(
                 f"{name} length {tokens.shape[1]} exceeds {self.max_seq_len}"
@@ -504,8 +512,6 @@ class DarkformerLM(nn.Module):
     ) -> tuple[torch.Tensor, DarkformerState]:
         """Return normalized features and recurrent attention state."""
         self._validate_tokens(tokens, "tokens")
-        if tokens.shape[1] < 1:
-            raise ValueError("tokens must contain at least one token")
         prior_length = 0 if state is None else state.sequence_length
         total_length = prior_length + tokens.shape[1]
         if self.max_seq_len is not None and total_length > self.max_seq_len:
@@ -541,7 +547,7 @@ class DarkformerLM(nn.Module):
         mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Return logits or next-token cross-entropy when labels are provided."""
+        """Return logits or next-token cross-entropy."""
         if labels is not None and not self.causal:
             raise RuntimeError("language-model loss requires causal attention")
         logits = self.output_projection(self.forward_features(tokens, mask=mask))
@@ -570,8 +576,6 @@ class DarkformerLM(nn.Module):
     ) -> torch.Tensor:
         """Autoregressively extend token prompts."""
         self._validate_tokens(prompt, "prompt")
-        if prompt.shape[1] < 1:
-            raise ValueError("prompt must contain at least one token")
         if not self.causal:
             raise RuntimeError("generation requires a causal language model")
         if max_new_tokens < 0:
@@ -590,7 +594,8 @@ class DarkformerLM(nn.Module):
             return prompt
         was_training = self.training
         self.eval()
-        generated = prompt
+        generated = _generation_buffer(prompt, requested_length)
+        current_length = prompt.shape[1]
         finished = torch.zeros(
             prompt.shape[0],
             dtype=torch.bool,
@@ -603,7 +608,7 @@ class DarkformerLM(nn.Module):
                 if self.transformer.supports_recurrent_state:
                     next_logits = logits[:, -1]
                 else:
-                    next_logits = self(generated)[:, -1]
+                    next_logits = self(generated[:, :current_length])[:, -1]
                 next_token = _sample_next_token(
                     next_logits,
                     temperature=temperature,
@@ -613,7 +618,8 @@ class DarkformerLM(nn.Module):
                     eos = torch.full_like(next_token, eos_token_id)
                     next_token = torch.where(finished[:, None], eos, next_token)
                     finished |= next_token.squeeze(1).eq(eos_token_id)
-                generated = torch.cat((generated, next_token), dim=1)
+                generated[:, current_length].copy_(next_token.squeeze(1))
+                current_length += 1
                 if eos_token_id is not None and bool(finished.all()):
                     break
                 if (
@@ -626,7 +632,7 @@ class DarkformerLM(nn.Module):
                     )
         finally:
             self.train(was_training)
-        return generated
+        return generated[:, :current_length]
 
 
 class DarkformerEncDec(nn.Module):
@@ -745,6 +751,8 @@ class DarkformerEncDec(nn.Module):
     ) -> None:
         if tokens.ndim != 2 or tokens.dtype not in (torch.int32, torch.int64):
             raise ValueError(f"{name} must be an integer tensor [batch, length]")
+        if tokens.shape[1] < 1:
+            raise ValueError(f"{name} must contain at least one token")
         if max_length is not None and tokens.shape[1] > max_length:
             raise ValueError(f"{name} length {tokens.shape[1]} exceeds {max_length}")
 
@@ -825,8 +833,6 @@ class DarkformerEncDec(nn.Module):
             name="target_tokens",
             max_length=self.max_target_length,
         )
-        if target_tokens.shape[1] < 1:
-            raise ValueError("target_tokens must contain at least one token")
         prior_length = 0 if state is None else state.sequence_length
         total_length = prior_length + target_tokens.shape[1]
         if self.max_target_length is not None and total_length > self.max_target_length:
@@ -908,10 +914,6 @@ class DarkformerEncDec(nn.Module):
         )
         if source_tokens.shape[0] != prompt.shape[0]:
             raise ValueError("source and prompt batch sizes must match")
-        if source_tokens.shape[1] < 1:
-            raise ValueError("source_tokens must contain at least one token")
-        if prompt.shape[1] < 1:
-            raise ValueError("prompt must contain at least one token")
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be nonnegative")
         if temperature <= 0.0:
@@ -931,7 +933,8 @@ class DarkformerEncDec(nn.Module):
             return prompt
         was_training = self.training
         self.eval()
-        generated = prompt
+        generated = _generation_buffer(prompt, requested_length)
+        current_length = prompt.shape[1]
         finished = torch.zeros(
             prompt.shape[0],
             dtype=torch.bool,
@@ -950,7 +953,7 @@ class DarkformerEncDec(nn.Module):
                     next_logits = logits[:, -1]
                 else:
                     next_logits = self.decode(
-                        generated,
+                        generated[:, :current_length],
                         context,
                         source_mask=source_mask,
                     )[:, -1]
@@ -963,7 +966,8 @@ class DarkformerEncDec(nn.Module):
                     eos = torch.full_like(next_token, eos_token_id)
                     next_token = torch.where(finished[:, None], eos, next_token)
                     finished |= next_token.squeeze(1).eq(eos_token_id)
-                generated = torch.cat((generated, next_token), dim=1)
+                generated[:, current_length].copy_(next_token.squeeze(1))
+                current_length += 1
                 if eos_token_id is not None and bool(finished.all()):
                     break
                 if self.decoder.supports_recurrent_state and index + 1 < max_new_tokens:
@@ -973,7 +977,7 @@ class DarkformerEncDec(nn.Module):
                     )
         finally:
             self.train(was_training)
-        return generated
+        return generated[:, :current_length]
 
 
 __all__ = [

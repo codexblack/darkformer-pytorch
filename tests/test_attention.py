@@ -249,6 +249,32 @@ def test_exact_mode_does_not_redraw_unused_features() -> None:
     assert attention._calls_since_redraw.item() == 0
 
 
+def test_unseeded_redraw_is_reproducible_from_checkpoint_state() -> None:
+    """Replicas redraw alike after their buffers are synchronized."""
+    first = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        num_features=8,
+    )
+    second = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        num_features=8,
+    )
+    second.load_state_dict(first.state_dict())
+
+    first.redraw_projection_matrices_()
+    torch.randn(32)
+    second.redraw_projection_matrices_()
+
+    torch.testing.assert_close(
+        first.random_features.projection_matrix,
+        second.random_features.projection_matrix,
+        rtol=0,
+        atol=0,
+    )
+
+
 def test_self_attention_shape_and_gradients() -> None:
     """Self-attention preserves shape and differentiates all core inputs."""
     torch.manual_seed(23)
@@ -393,9 +419,7 @@ def test_causal_attention_does_not_depend_on_future_keys() -> None:
     )
     with torch.no_grad():
         attention.random_features.projection_matrix.copy_(
-            torch.tensor(
-                [[20.0, 0.0], [-20.0, 0.0], [0.0, 1.0], [0.0, -1.0]]
-            )
+            torch.tensor([[20.0, 0.0], [-20.0, 0.0], [0.0, 1.0], [0.0, -1.0]])
         )
     query = torch.tensor([[[[1.0, 0.0], [0.5, 0.0], [0.0, 0.0], [0.0, 0.0]]]])
     key = torch.tensor([[[[1.0, 0.0], [-1.0, 0.0], [0.0, 0.0], [0.0, 0.0]]]])
@@ -549,3 +573,66 @@ def test_rotary_offset_matches_full_sequence_for_odd_head_dim() -> None:
         full_query,
     )
     torch.testing.assert_close(torch.cat((first_key, second_key), dim=2), full_key)
+
+
+def test_rotary_cache_rebuilds_after_dtype_round_trip() -> None:
+    """Rotary values retain precision across dtype changes."""
+    rotary = RotaryEmbedding(8)
+    query = torch.randn(1, 2, 32, 8)
+    key = torch.randn(1, 2, 32, 8)
+    expected_query, expected_key = rotary(query, key)
+
+    rotary.to(dtype=torch.bfloat16)
+    rotary(query.bfloat16(), key.bfloat16())
+    rotary.float()
+    actual_query, actual_key = rotary(query, key)
+
+    torch.testing.assert_close(actual_query, expected_query, rtol=0, atol=0)
+    torch.testing.assert_close(actual_key, expected_key, rtol=0, atol=0)
+
+
+def test_bfloat16_linear_attention_returns_model_dtype() -> None:
+    """Linear attention accumulates stably and returns the requested dtype."""
+    attention = SelfAttention(
+        8,
+        heads=2,
+        head_dim=4,
+        num_features=8,
+        causal=True,
+        deterministic=True,
+    ).to(dtype=torch.bfloat16)
+    inputs = torch.randn(2, 4, 8, dtype=torch.bfloat16)
+
+    output = attention(inputs)
+
+    assert output.dtype == torch.bfloat16
+    assert torch.all(torch.isfinite(output))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_cuda_forward_backward() -> None:
+    """Modules move to CUDA with their parameters and projection buffers."""
+    attention = SelfAttention(
+        16,
+        heads=2,
+        head_dim=8,
+        num_features=16,
+        causal=True,
+        deterministic=True,
+    ).to(device="cuda", dtype=torch.bfloat16)
+    inputs = torch.randn(
+        2,
+        8,
+        16,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
+    )
+
+    output = attention(inputs)
+    output.float().square().mean().backward()
+
+    assert output.device.type == "cuda"
+    assert output.dtype == torch.bfloat16
+    assert inputs.grad is not None
+    assert attention.geometry.grad is not None
