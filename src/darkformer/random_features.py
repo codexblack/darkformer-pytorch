@@ -226,6 +226,42 @@ class DataAwareRandomFeatures(nn.Module):
             return self.geometry
         return self.geometry.expand(self.num_heads, -1, -1)
 
+    def _validate_data(self, data: torch.Tensor) -> None:
+        if data.ndim != 4:
+            raise ValueError(
+                "data must have shape [batch, heads, length, head_dim]"
+            )
+        if data.shape[1] != self.num_heads or data.shape[-1] != self.head_dim:
+            raise ValueError(
+                f"data must have {self.num_heads} heads and head_dim "
+                f"{self.head_dim}"
+            )
+
+    def feature_logits(self, data: torch.Tensor) -> torch.Tensor:
+        """Return unnormalized log positive features."""
+        self._validate_data(data)
+        scaled_data = data * (self.head_dim**-0.25)
+        transformed = torch.einsum(
+            "bhnd,hrd->bhnr",
+            scaled_data,
+            self._geometry_for_heads(),
+        )
+        projected = torch.matmul(
+            transformed,
+            self.projection_matrix.transpose(0, 1),
+        )
+        accumulation_dtype = (
+            torch.float32
+            if projected.dtype in (torch.float16, torch.bfloat16)
+            else projected.dtype
+        )
+        projected = projected.to(accumulation_dtype)
+        transformed = transformed.to(accumulation_dtype)
+        return projected - 0.5 * transformed.square().sum(
+            dim=-1,
+            keepdim=True,
+        )
+
     def _feature_map(
         self,
         data: torch.Tensor,
@@ -234,21 +270,7 @@ class DataAwareRandomFeatures(nn.Module):
         mask: torch.Tensor | None,
         stabilize: bool,
     ) -> torch.Tensor:
-        scaled_data = data * (self.head_dim**-0.25)
-        transformed = torch.einsum(
-            "bhnd,hrd->bhnr",
-            scaled_data,
-            self._geometry_for_heads(),
-        )
-        projected = torch.matmul(transformed, self.projection_matrix.transpose(0, 1))
-        accumulation_dtype = (
-            torch.float32
-            if projected.dtype in (torch.float16, torch.bfloat16)
-            else projected.dtype
-        )
-        projected = projected.to(accumulation_dtype)
-        transformed = transformed.to(accumulation_dtype)
-        logits = projected - 0.5 * transformed.square().sum(dim=-1, keepdim=True)
+        logits = self.feature_logits(data)
 
         if stabilize:
             if is_query:
@@ -262,12 +284,53 @@ class DataAwareRandomFeatures(nn.Module):
                 )
                 maximum = valid_logits.amax(dim=(-2, -1), keepdim=True).detach()
                 maximum = torch.where(torch.isfinite(maximum), maximum, 0.0)
-            logits = logits - maximum
-
-        features = (torch.exp(logits) + self.eps) * self.num_features**-0.5
+            maximum = maximum.clamp_min(0.0)
+            features = torch.exp(logits - maximum)
+            features = features + self.eps * torch.exp(-maximum)
+        else:
+            features = torch.exp(logits) + self.eps
+        features = features * self.num_features**-0.5
         if mask is not None:
             features = features.masked_fill(~mask[:, None, :, None], 0.0)
         return features
+
+    def query_feature_map(
+        self,
+        query: torch.Tensor,
+        *,
+        stabilize: bool = True,
+    ) -> torch.Tensor:
+        """Map queries into the learned random-feature space."""
+        return self._feature_map(
+            query,
+            is_query=True,
+            mask=None,
+            stabilize=stabilize,
+        )
+
+    def key_feature_map(
+        self,
+        key: torch.Tensor,
+        *,
+        key_mask: torch.Tensor | None = None,
+        stabilize: bool = True,
+    ) -> torch.Tensor:
+        """Map keys into the learned random-feature space."""
+        self._validate_data(key)
+        if key_mask is not None:
+            expected_shape = (key.shape[0], key.shape[2])
+            if key_mask.dtype != torch.bool:
+                raise TypeError("key_mask must have dtype torch.bool")
+            if key_mask.device != key.device:
+                raise ValueError("key_mask must be on the same device as key")
+            if tuple(key_mask.shape) != expected_shape:
+                raise ValueError(f"key_mask must have shape {expected_shape}")
+        return self._feature_map(
+            key,
+            is_query=False,
+            mask=key_mask,
+            stabilize=stabilize,
+        )
 
     def forward(
         self,
@@ -279,16 +342,10 @@ class DataAwareRandomFeatures(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Map queries and keys into the learned random-feature space."""
         self._validate_inputs(query, key, key_mask)
-        query_features = self._feature_map(
-            query,
-            is_query=True,
-            mask=None,
-            stabilize=stabilize,
-        )
-        key_features = self._feature_map(
+        query_features = self.query_feature_map(query, stabilize=stabilize)
+        key_features = self.key_feature_map(
             key,
-            is_query=False,
-            mask=key_mask,
+            key_mask=key_mask,
             stabilize=stabilize,
         )
         return query_features, key_features

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from dataclasses import dataclass
 from typing import cast
 
 import torch
@@ -11,10 +12,53 @@ from torch.nn import functional
 
 from darkformer.attention import (
     AttentionMode,
+    CausalAttentionState,
+    ContextAttentionState,
     CrossAttention,
     SelfAttention,
 )
 from darkformer.backends import AttentionBackend
+
+
+@dataclass
+class DarkformerLayerState:
+    """Recurrent attention state for one transformer layer."""
+
+    self_attention: CausalAttentionState
+    cross_attention: ContextAttentionState | None = None
+
+
+@dataclass
+class DarkformerState:
+    """Recurrent attention state for a transformer stack."""
+
+    layers: tuple[DarkformerLayerState, ...]
+
+    @property
+    def sequence_length(self) -> int:
+        """Number of sequence positions represented by the state."""
+        if not self.layers:
+            raise ValueError("state must contain at least one layer")
+        length = self.layers[0].self_attention.sequence_length
+        if any(
+            layer.self_attention.sequence_length != length for layer in self.layers[1:]
+        ):
+            raise ValueError("all layer states must have the same sequence length")
+        return length
+
+
+def _sample_next_token(
+    logits: torch.Tensor,
+    *,
+    temperature: float,
+    top_k: int | None,
+) -> torch.Tensor:
+    logits = logits / temperature
+    if top_k is not None:
+        count = min(top_k, logits.shape[-1])
+        threshold = logits.topk(count, dim=-1).values[:, -1, None]
+        logits = logits.masked_fill(logits < threshold, -torch.inf)
+    return torch.multinomial(logits.softmax(dim=-1), 1)
 
 
 class FeedForward(nn.Module):
@@ -133,6 +177,49 @@ class DarkformerBlock(nn.Module):
         inputs = inputs + self.feed_forward(self.feed_forward_norm(inputs))
         return inputs
 
+    def forward_with_state(
+        self,
+        inputs: torch.Tensor,
+        *,
+        state: DarkformerLayerState | None = None,
+        mask: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, DarkformerLayerState]:
+        """Apply a causal block and return its recurrent attention state."""
+        self_state = None if state is None else state.self_attention
+        self_output, next_self_state = self.self_attention.forward_with_state(
+            self.self_norm(inputs),
+            state=self_state,
+            mask=mask,
+        )
+        inputs = inputs + self_output
+
+        context_state = None if state is None else state.cross_attention
+        if self.cross_attention is not None:
+            if self.cross_norm is None:
+                raise RuntimeError("cross-attention normalization is unavailable")
+            if context_state is None:
+                if context is None:
+                    raise ValueError("context is required to initialize decoder state")
+                context_state = self.cross_attention.build_context_state(
+                    context,
+                    context_mask=context_mask,
+                )
+            inputs = inputs + self.cross_attention.forward_with_state(
+                self.cross_norm(inputs),
+                context_state,
+                mask=mask,
+            )
+        elif context_state is not None:
+            raise ValueError("cross-attention state was provided to an encoder layer")
+
+        inputs = inputs + self.feed_forward(self.feed_forward_norm(inputs))
+        return inputs, DarkformerLayerState(
+            self_attention=next_self_state,
+            cross_attention=context_state,
+        )
+
 
 class Darkformer(nn.Module):
     """A stack of DARKformer blocks for encoded input sequences."""
@@ -170,6 +257,7 @@ class Darkformer(nn.Module):
         self.depth = depth
         self.causal = causal
         self.cross_attend = cross_attend
+        self.attention_mode = attention_mode
         layers = []
         for index in range(depth):
             layer_seed = (
@@ -198,6 +286,11 @@ class Darkformer(nn.Module):
                 )
             )
         self.layers = nn.ModuleList(layers)
+
+    @property
+    def supports_recurrent_state(self) -> bool:
+        """Whether the stack supports recurrent linear-attention state."""
+        return self.causal and self.attention_mode == "linear"
 
     def _attention_modules(self) -> Iterator[SelfAttention | CrossAttention]:
         for module in self.layers:
@@ -249,6 +342,53 @@ class Darkformer(nn.Module):
                 context_mask=context_mask,
             )
         return inputs
+
+    def forward_with_state(
+        self,
+        inputs: torch.Tensor,
+        *,
+        state: DarkformerState | None = None,
+        mask: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, DarkformerState]:
+        """Transform an appended sequence chunk and return recurrent state."""
+        if not self.supports_recurrent_state:
+            raise RuntimeError(
+                "recurrent state requires a causal attention_mode='linear' stack"
+            )
+        if inputs.ndim != 3 or inputs.shape[-1] != self.dim:
+            raise ValueError(f"inputs must have shape [batch, length, {self.dim}]")
+        if inputs.shape[1] < 1:
+            raise ValueError("inputs must contain at least one sequence position")
+        if state is None:
+            layer_states: tuple[DarkformerLayerState | None, ...] = (None,) * self.depth
+        else:
+            if len(state.layers) != self.depth:
+                raise ValueError(f"state must contain {self.depth} layer states")
+            _ = state.sequence_length
+            layer_states = state.layers
+            if context is not None:
+                raise ValueError("context must be omitted when reusing decoder state")
+            if context_mask is not None:
+                raise ValueError(
+                    "context_mask must be omitted when reusing decoder state"
+                )
+        if self.cross_attend and state is None and context is None:
+            raise ValueError("context is required to initialize decoder state")
+
+        next_states = []
+        for index, module in enumerate(self.layers):
+            layer = cast(DarkformerBlock, module)
+            inputs, next_state = layer.forward_with_state(
+                inputs,
+                state=layer_states[index],
+                mask=mask,
+                context=context,
+                context_mask=context_mask,
+            )
+            next_states.append(next_state)
+        return inputs, DarkformerState(tuple(next_states))
 
 
 class DarkformerLM(nn.Module):
@@ -355,6 +495,45 @@ class DarkformerLM(nn.Module):
         hidden = self.transformer(hidden, mask=mask)
         return self.final_norm(hidden)
 
+    def forward_features_with_state(
+        self,
+        tokens: torch.Tensor,
+        *,
+        state: DarkformerState | None = None,
+        mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, DarkformerState]:
+        """Return normalized features and recurrent attention state."""
+        self._validate_tokens(tokens, "tokens")
+        if tokens.shape[1] < 1:
+            raise ValueError("tokens must contain at least one token")
+        prior_length = 0 if state is None else state.sequence_length
+        total_length = prior_length + tokens.shape[1]
+        if self.max_seq_len is not None and total_length > self.max_seq_len:
+            raise ValueError(
+                f"cached token length {total_length} exceeds {self.max_seq_len}"
+            )
+        hidden, next_state = self.transformer.forward_with_state(
+            self.token_embedding(tokens),
+            state=state,
+            mask=mask,
+        )
+        return self.final_norm(hidden), next_state
+
+    def forward_with_state(
+        self,
+        tokens: torch.Tensor,
+        *,
+        state: DarkformerState | None = None,
+        mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, DarkformerState]:
+        """Return logits and recurrent attention state for an appended chunk."""
+        features, next_state = self.forward_features_with_state(
+            tokens,
+            state=state,
+            mask=mask,
+        )
+        return self.output_projection(features), next_state
+
     def forward(
         self,
         tokens: torch.Tensor,
@@ -363,6 +542,8 @@ class DarkformerLM(nn.Module):
         labels: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Return logits or next-token cross-entropy when labels are provided."""
+        if labels is not None and not self.causal:
+            raise RuntimeError("language-model loss requires causal attention")
         logits = self.output_projection(self.forward_features(tokens, mask=mask))
         if labels is None:
             return logits
@@ -373,7 +554,7 @@ class DarkformerLM(nn.Module):
             raise ValueError("at least two tokens are required for language-model loss")
         return functional.cross_entropy(
             logits[:, :-1].reshape(-1, self.vocab_size),
-            labels[:, 1:].reshape(-1),
+            labels[:, 1:].reshape(-1).long(),
             ignore_index=-100,
         )
 
@@ -389,6 +570,8 @@ class DarkformerLM(nn.Module):
     ) -> torch.Tensor:
         """Autoregressively extend token prompts."""
         self._validate_tokens(prompt, "prompt")
+        if prompt.shape[1] < 1:
+            raise ValueError("prompt must contain at least one token")
         if not self.causal:
             raise RuntimeError("generation requires a causal language model")
         if max_new_tokens < 0:
@@ -397,6 +580,14 @@ class DarkformerLM(nn.Module):
             raise ValueError("temperature must be positive")
         if top_k is not None and top_k < 1:
             raise ValueError("top_k must be positive")
+        requested_length = prompt.shape[1] + max_new_tokens
+        if self.max_seq_len is not None and requested_length > self.max_seq_len:
+            raise ValueError(
+                f"requested sequence length {requested_length} exceeds "
+                f"{self.max_seq_len}"
+            )
+        if max_new_tokens == 0:
+            return prompt
         was_training = self.training
         self.eval()
         generated = prompt
@@ -406,13 +597,18 @@ class DarkformerLM(nn.Module):
             device=prompt.device,
         )
         try:
-            for _ in range(max_new_tokens):
-                logits = self(generated)[:, -1] / temperature
-                if top_k is not None:
-                    count = min(top_k, logits.shape[-1])
-                    threshold = logits.topk(count, dim=-1).values[:, -1, None]
-                    logits = logits.masked_fill(logits < threshold, -torch.inf)
-                next_token = torch.multinomial(logits.softmax(dim=-1), 1)
+            if self.transformer.supports_recurrent_state:
+                logits, state = self.forward_with_state(prompt)
+            for index in range(max_new_tokens):
+                if self.transformer.supports_recurrent_state:
+                    next_logits = logits[:, -1]
+                else:
+                    next_logits = self(generated)[:, -1]
+                next_token = _sample_next_token(
+                    next_logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                )
                 if eos_token_id is not None:
                     eos = torch.full_like(next_token, eos_token_id)
                     next_token = torch.where(finished[:, None], eos, next_token)
@@ -420,6 +616,14 @@ class DarkformerLM(nn.Module):
                 generated = torch.cat((generated, next_token), dim=1)
                 if eos_token_id is not None and bool(finished.all()):
                     break
+                if (
+                    self.transformer.supports_recurrent_state
+                    and index + 1 < max_new_tokens
+                ):
+                    logits, state = self.forward_with_state(
+                        next_token,
+                        state=state,
+                    )
         finally:
             self.train(was_training)
         return generated
@@ -606,6 +810,43 @@ class DarkformerEncDec(nn.Module):
         )
         return self.output_projection(self.decoder_norm(decoded))
 
+    def decode_with_state(
+        self,
+        target_tokens: torch.Tensor,
+        context: torch.Tensor | None = None,
+        *,
+        state: DarkformerState | None = None,
+        target_mask: torch.Tensor | None = None,
+        source_mask: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, DarkformerState]:
+        """Decode an appended target chunk and return recurrent state."""
+        self._validate_tokens(
+            target_tokens,
+            name="target_tokens",
+            max_length=self.max_target_length,
+        )
+        if target_tokens.shape[1] < 1:
+            raise ValueError("target_tokens must contain at least one token")
+        prior_length = 0 if state is None else state.sequence_length
+        total_length = prior_length + target_tokens.shape[1]
+        if self.max_target_length is not None and total_length > self.max_target_length:
+            raise ValueError(
+                f"cached target length {total_length} exceeds {self.max_target_length}"
+            )
+        if state is None and context is None:
+            raise ValueError("context is required to initialize decoder state")
+        if context is not None and context.shape[0] != target_tokens.shape[0]:
+            raise ValueError("target and context batch sizes must match")
+        decoded, next_state = self.decoder.forward_with_state(
+            self.target_embedding(target_tokens),
+            state=state,
+            mask=target_mask,
+            context=context,
+            context_mask=source_mask,
+        )
+        logits = self.output_projection(self.decoder_norm(decoded))
+        return logits, next_state
+
     def forward(
         self,
         source_tokens: torch.Tensor,
@@ -638,7 +879,7 @@ class DarkformerEncDec(nn.Module):
             raise ValueError("at least two target tokens are required for loss")
         return functional.cross_entropy(
             logits[:, :-1].reshape(-1, self.target_vocab_size),
-            labels[:, 1:].reshape(-1),
+            labels[:, 1:].reshape(-1).long(),
             ignore_index=-100,
         )
 
@@ -655,14 +896,39 @@ class DarkformerEncDec(nn.Module):
         top_k: int | None = None,
     ) -> torch.Tensor:
         """Generate target tokens while reusing the encoded source context."""
+        self._validate_tokens(
+            source_tokens,
+            name="source_tokens",
+            max_length=self.max_source_length,
+        )
+        self._validate_tokens(
+            prompt,
+            name="prompt",
+            max_length=self.max_target_length,
+        )
         if source_tokens.shape[0] != prompt.shape[0]:
             raise ValueError("source and prompt batch sizes must match")
+        if source_tokens.shape[1] < 1:
+            raise ValueError("source_tokens must contain at least one token")
+        if prompt.shape[1] < 1:
+            raise ValueError("prompt must contain at least one token")
         if max_new_tokens < 0:
             raise ValueError("max_new_tokens must be nonnegative")
         if temperature <= 0.0:
             raise ValueError("temperature must be positive")
         if top_k is not None and top_k < 1:
             raise ValueError("top_k must be positive")
+        requested_length = prompt.shape[1] + max_new_tokens
+        if (
+            self.max_target_length is not None
+            and requested_length > self.max_target_length
+        ):
+            raise ValueError(
+                f"requested target length {requested_length} exceeds "
+                f"{self.max_target_length}"
+            )
+        if max_new_tokens == 0:
+            return prompt
         was_training = self.training
         self.eval()
         generated = prompt
@@ -673,18 +939,26 @@ class DarkformerEncDec(nn.Module):
         )
         try:
             context = self.encode(source_tokens, source_mask=source_mask)
-            for _ in range(max_new_tokens):
-                logits = self.decode(
-                    generated,
+            if self.decoder.supports_recurrent_state:
+                logits, state = self.decode_with_state(
+                    prompt,
                     context,
                     source_mask=source_mask,
-                )[:, -1]
-                logits = logits / temperature
-                if top_k is not None:
-                    count = min(top_k, logits.shape[-1])
-                    threshold = logits.topk(count, dim=-1).values[:, -1, None]
-                    logits = logits.masked_fill(logits < threshold, -torch.inf)
-                next_token = torch.multinomial(logits.softmax(dim=-1), 1)
+                )
+            for index in range(max_new_tokens):
+                if self.decoder.supports_recurrent_state:
+                    next_logits = logits[:, -1]
+                else:
+                    next_logits = self.decode(
+                        generated,
+                        context,
+                        source_mask=source_mask,
+                    )[:, -1]
+                next_token = _sample_next_token(
+                    next_logits,
+                    temperature=temperature,
+                    top_k=top_k,
+                )
                 if eos_token_id is not None:
                     eos = torch.full_like(next_token, eos_token_id)
                     next_token = torch.where(finished[:, None], eos, next_token)
@@ -692,6 +966,11 @@ class DarkformerEncDec(nn.Module):
                 generated = torch.cat((generated, next_token), dim=1)
                 if eos_token_id is not None and bool(finished.all()):
                     break
+                if self.decoder.supports_recurrent_state and index + 1 < max_new_tokens:
+                    logits, state = self.decode_with_state(
+                        next_token,
+                        state=state,
+                    )
         finally:
             self.train(was_training)
         return generated
@@ -702,4 +981,6 @@ __all__ = [
     "DarkformerBlock",
     "DarkformerEncDec",
     "DarkformerLM",
+    "DarkformerLayerState",
+    "DarkformerState",
 ]

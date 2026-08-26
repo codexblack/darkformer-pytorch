@@ -7,6 +7,7 @@ import darkformer.attention as attention_module
 from darkformer.attention import (
     CrossAttention,
     DarkformerKernelAttention,
+    RotaryEmbedding,
     SelfAttention,
 )
 
@@ -223,6 +224,31 @@ def test_auto_mode_routes_around_threshold(
     assert long_output.shape == (1, 1, 4, 2)
 
 
+def test_exact_mode_does_not_redraw_unused_features() -> None:
+    """Exact attention does not advance the random-feature redraw schedule."""
+    attention = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        num_features=8,
+        attention_mode="exact",
+        exact_backend="sdpa",
+        feature_redraw_interval=1,
+        projection_seed=5,
+    )
+    tensor = torch.randn(1, 1, 3, 4)
+    projection = attention.random_features.projection_matrix.clone()
+
+    attention(tensor, tensor, tensor)
+
+    torch.testing.assert_close(
+        attention.random_features.projection_matrix,
+        projection,
+        rtol=0,
+        atol=0,
+    )
+    assert attention._calls_since_redraw.item() == 0
+
+
 def test_self_attention_shape_and_gradients() -> None:
     """Self-attention preserves shape and differentiates all core inputs."""
     torch.manual_seed(23)
@@ -233,7 +259,6 @@ def test_self_attention_shape_and_gradients() -> None:
         num_features=12,
         orthogonal_features=False,
         causal=True,
-        output_bias=False,
         causal_chunk_size=2,
         projection_seed=29,
         deterministic=True,
@@ -264,7 +289,6 @@ def test_cross_attention_unequal_lengths_shape_and_gradients() -> None:
         head_dim=4,
         num_features=12,
         orthogonal_features=False,
-        output_bias=False,
         projection_seed=37,
         deterministic=True,
     )
@@ -294,3 +318,234 @@ def test_cross_attention_unequal_lengths_shape_and_gradients() -> None:
     assert torch.count_nonzero(context.grad) > 0
     assert attention.geometry.grad is not None
     assert torch.count_nonzero(attention.geometry.grad) > 0
+
+
+def test_causal_state_matches_full_attention_across_chunks() -> None:
+    """Recurrent causal attention matches a full-sequence evaluation."""
+    generator = torch.Generator().manual_seed(41)
+    attention = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=2,
+        num_features=16,
+        orthogonal_features=False,
+        causal=True,
+        causal_chunk_size=2,
+        projection_seed=43,
+        deterministic=True,
+    )
+    query = 0.25 * torch.randn(2, 2, 7, 4, generator=generator)
+    key = 0.25 * torch.randn(2, 2, 7, 4, generator=generator)
+    value = torch.randn(2, 2, 7, 3, generator=generator)
+    mask = torch.tensor(
+        [
+            [True, True, True, True, False, True, True],
+            [True, True, False, True, True, True, False],
+        ]
+    )
+
+    expected = attention(
+        query,
+        key,
+        value,
+        query_mask=mask,
+        key_mask=mask,
+    )
+    first, state = attention.forward_with_state(
+        query[:, :, :3],
+        key[:, :, :3],
+        value[:, :, :3],
+        query_mask=mask[:, :3],
+        key_mask=mask[:, :3],
+    )
+    second, state = attention.forward_with_state(
+        query[:, :, 3:5],
+        key[:, :, 3:5],
+        value[:, :, 3:5],
+        state=state,
+        query_mask=mask[:, 3:5],
+        key_mask=mask[:, 3:5],
+    )
+    third, state = attention.forward_with_state(
+        query[:, :, 5:],
+        key[:, :, 5:],
+        value[:, :, 5:],
+        state=state,
+        query_mask=mask[:, 5:],
+        key_mask=mask[:, 5:],
+    )
+
+    torch.testing.assert_close(torch.cat((first, second, third), dim=2), expected)
+    assert state.sequence_length == 7
+
+
+def test_causal_attention_does_not_depend_on_future_keys() -> None:
+    """Changing future keys and values leaves earlier outputs unchanged."""
+    attention = DarkformerKernelAttention(
+        head_dim=2,
+        num_heads=1,
+        num_features=4,
+        orthogonal_features=False,
+        causal=True,
+        causal_chunk_size=8,
+        eps=1e-2,
+        projection_seed=53,
+        deterministic=True,
+    )
+    with torch.no_grad():
+        attention.random_features.projection_matrix.copy_(
+            torch.tensor(
+                [[20.0, 0.0], [-20.0, 0.0], [0.0, 1.0], [0.0, -1.0]]
+            )
+        )
+    query = torch.tensor([[[[1.0, 0.0], [0.5, 0.0], [0.0, 0.0], [0.0, 0.0]]]])
+    key = torch.tensor([[[[1.0, 0.0], [-1.0, 0.0], [0.0, 0.0], [0.0, 0.0]]]])
+    value = torch.tensor([[[[1.0, 0.0], [0.0, 1.0], [2.0, 3.0], [4.0, 5.0]]]])
+    changed_key = key.clone()
+    changed_value = value.clone()
+    changed_key[:, :, 2] = torch.tensor([10.0, 0.0])
+    changed_value[:, :, 2:] *= -7.0
+
+    original = attention(query, key, value)
+    changed = attention(query, changed_key, changed_value)
+
+    torch.testing.assert_close(
+        original[:, :, :2],
+        changed[:, :, :2],
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_all_masked_causal_chunk_preserves_statistics() -> None:
+    """Masked continuation positions do not alter recurrent statistics."""
+    attention = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        num_features=8,
+        causal=True,
+        deterministic=True,
+    )
+    tensor = torch.randn(1, 1, 2, 4)
+    _, state = attention.forward_with_state(tensor, tensor, tensor)
+    masked = torch.zeros(1, 3, dtype=torch.bool)
+    continuation = torch.randn(1, 1, 3, 4)
+
+    output, next_state = attention.forward_with_state(
+        continuation,
+        continuation,
+        continuation,
+        state=state,
+        query_mask=masked,
+        key_mask=masked,
+    )
+
+    assert torch.count_nonzero(output) == 0
+    torch.testing.assert_close(next_state.key_sum, state.key_sum)
+    torch.testing.assert_close(next_state.key_value_sum, state.key_value_sum)
+    torch.testing.assert_close(next_state.key_log_scale, state.key_log_scale)
+    assert next_state.sequence_length == 5
+
+
+def test_causal_state_rejects_projection_redraw() -> None:
+    """A state cannot be continued after its feature basis changes."""
+    attention = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        num_features=8,
+        causal=True,
+        deterministic=True,
+    )
+    tensor = torch.randn(1, 1, 2, 4)
+    _, state = attention.forward_with_state(tensor, tensor, tensor)
+    attention.redraw_projection_matrices_(force=True)
+
+    with pytest.raises(RuntimeError, match="projection matrices changed"):
+        attention.forward_with_state(
+            tensor[:, :, :1],
+            tensor[:, :, :1],
+            tensor[:, :, :1],
+            state=state,
+        )
+
+
+def test_context_state_matches_cross_attention() -> None:
+    """Precomputed context statistics match repeated cross-attention."""
+    generator = torch.Generator().manual_seed(59)
+    attention = CrossAttention(
+        8,
+        context_dim=6,
+        heads=2,
+        head_dim=4,
+        num_features=16,
+        orthogonal_features=False,
+        projection_seed=61,
+        deterministic=True,
+    )
+    inputs = torch.randn(2, 5, 8, generator=generator)
+    context = torch.randn(2, 7, 6, generator=generator)
+    mask = torch.tensor(
+        [[True, True, False, True, True], [True, False, True, True, True]]
+    )
+    context_mask = torch.tensor(
+        [
+            [True, True, True, False, True, False, True],
+            [True, False, True, True, True, True, False],
+        ]
+    )
+
+    expected = attention(
+        inputs,
+        context,
+        mask=mask,
+        context_mask=context_mask,
+    )
+    state = attention.build_context_state(context, context_mask=context_mask)
+    first = attention.forward_with_state(inputs[:, :2], state, mask=mask[:, :2])
+    second = attention.forward_with_state(inputs[:, 2:], state, mask=mask[:, 2:])
+
+    torch.testing.assert_close(torch.cat((first, second), dim=1), expected)
+
+
+def test_self_attention_state_uses_rotary_offset() -> None:
+    """Stateful self-attention preserves full-sequence rotary positions."""
+    torch.manual_seed(67)
+    attention = SelfAttention(
+        8,
+        heads=2,
+        head_dim=4,
+        num_features=16,
+        causal=True,
+        rotary=True,
+        dropout=0.0,
+        projection_seed=71,
+        deterministic=True,
+    )
+    inputs = torch.randn(2, 6, 8)
+
+    expected = attention(inputs)
+    first, state = attention.forward_with_state(inputs[:, :4])
+    second, state = attention.forward_with_state(inputs[:, 4:], state=state)
+
+    torch.testing.assert_close(torch.cat((first, second), dim=1), expected)
+    assert state.sequence_length == 6
+
+
+def test_rotary_offset_matches_full_sequence_for_odd_head_dim() -> None:
+    """Rotary chunks match the corresponding full-sequence positions."""
+    rotary = RotaryEmbedding(5)
+    query = torch.randn(1, 2, 6, 5)
+    key = torch.randn(1, 2, 6, 5)
+
+    full_query, full_key = rotary(query, key)
+    first_query, first_key = rotary(query[:, :, :2], key[:, :, :2])
+    second_query, second_key = rotary(
+        query[:, :, 2:],
+        key[:, :, 2:],
+        offset=2,
+    )
+
+    torch.testing.assert_close(
+        torch.cat((first_query, second_query), dim=2),
+        full_query,
+    )
+    torch.testing.assert_close(torch.cat((first_key, second_key), dim=2), full_key)
