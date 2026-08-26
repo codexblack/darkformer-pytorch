@@ -15,22 +15,22 @@ Inspiration was taken from lucidrain's [performer-pytorch](https://github.com/lu
 ## Kernel
 
 For each attention head, DARKformer replaces the usual dot-product kernel with:
-
+<br></br>
 ```math
 \begin{aligned}
 \Sigma &= M^\mathsf{T} M \succeq 0, \\
 \kappa_\Sigma(q, k) &= \exp\!\left(q^\mathsf{T} \Sigma k\right).
 \end{aligned}
 ```
-
+<br></br>
 The public attention modules apply $d_h^{-1/4}$ to both queries and keys. For
 unscaled inputs, the evaluated kernel is therefore
-
+<br></br>
 ```math
 \kappa_\Sigma(q, k)
 = \exp\!\left(\frac{q^\mathsf{T}\Sigma k}{\sqrt{d_h}}\right).
 ```
-
+<br></br>
 The factorization keeps $\Sigma$ positive semidefinite. For $m$ features with each
 $\omega_j$ sampled from a standard Gaussian, the corresponding positive random
 feature map is
@@ -43,11 +43,12 @@ feature map is
     - \frac{1}{2} x^\mathsf{T} \Sigma x
   \right),
 \qquad
-\omega_j \sim \mathcal{N}(0, I).
+\omega_j \sim \mathcal{N}(0, I). 
 ```
-
+<br></br>
 The finite feature map approximates the learned kernel, and normalized attention
 can be evaluated associatively:
+<br></br>
 
 ```math
 \mathrm{Att}(Q, K, V)
@@ -58,7 +59,7 @@ can be evaluated associatively:
   \Phi(Q)\left(\Phi(K)^\mathsf{T} \mathbf{1}\right)
 }.
 ```
-
+<br></br>
 For sequence length $L$, head dimension $d_h$, and $m$ random features, this ordering
 costs $O(L m d_h)$ per head and does not construct the $L \times L$ score matrix.
 Exact attention costs $O(L^2 d_h)$. Learning $M$ aligns the sampling covariance with
