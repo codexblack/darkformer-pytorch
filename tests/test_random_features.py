@@ -2,6 +2,7 @@
 
 import math
 
+import pytest
 import torch
 
 from darkformer_pytorch.random_features import DataAwareRandomFeatures
@@ -23,15 +24,107 @@ def test_identity_covariance_initialization() -> None:
     assert "projection_matrix" in dict(random_features.named_buffers())
 
 
+def test_paper_faithful_feature_defaults() -> None:
+    """The default estimator uses IID features without an additive floor."""
+    random_features = DataAwareRandomFeatures(
+        head_dim=4,
+        num_heads=2,
+        num_features=16,
+    )
+
+    assert not random_features.orthogonal
+    assert random_features.eps == 0.0
+
+
+def test_whitening_initialization_matches_empirical_inverse_covariance() -> None:
+    """Calibration sets geometry to the empirical inverse square root."""
+    generator = torch.Generator().manual_seed(5)
+    samples = torch.randn(8, 2, 128, 3, generator=generator)
+    mixing = torch.tensor(
+        [[2.0, 0.0, 0.0], [0.7, 0.5, 0.0], [-0.2, 0.4, 1.5]],
+    )
+    samples = samples @ mixing.transpose(0, 1)
+    random_features = DataAwareRandomFeatures(
+        head_dim=3,
+        num_heads=2,
+        num_features=16,
+    )
+
+    random_features.initialize_whitening_(samples, regularization=0.0)
+    transformed = samples @ random_features.geometry.transpose(-1, -2)
+    centered = transformed - transformed.mean(dim=(0, 2), keepdim=True)
+    covariance = torch.einsum("bhld,bhle->hde", centered, centered)
+    covariance = covariance / (samples.shape[0] * samples.shape[2] - 1)
+
+    expected = torch.eye(3).expand(2, -1, -1)
+    torch.testing.assert_close(covariance, expected, rtol=2e-4, atol=2e-4)
+
+
+def test_whitening_initialization_respects_masks() -> None:
+    """Masked samples do not contribute to covariance calibration."""
+    generator = torch.Generator().manual_seed(7)
+    samples = torch.randn(1, 1, 8, 3, generator=generator)
+    samples[:, :, 6:] = 1_000.0
+    mask = torch.tensor([[True, True, True, True, True, True, False, False]])
+    masked = DataAwareRandomFeatures(3, 1, 16)
+    sliced = DataAwareRandomFeatures(3, 1, 16)
+
+    masked.initialize_whitening_(samples, query_mask=mask)
+    sliced.initialize_whitening_(samples[:, :, :6])
+
+    torch.testing.assert_close(masked.geometry, sliced.geometry)
+
+
+def test_shared_whitening_pools_head_means() -> None:
+    """Shared geometry uses covariance across every head sample."""
+    samples = torch.tensor(
+        [
+            [
+                [[-1.0, 0.0], [1.0, 0.0], [0.0, -1.0], [0.0, 1.0]],
+                [[9.0, 0.0], [11.0, 0.0], [10.0, -1.0], [10.0, 1.0]],
+            ]
+        ]
+    )
+    random_features = DataAwareRandomFeatures(
+        head_dim=2,
+        num_heads=2,
+        num_features=16,
+        per_head=False,
+    )
+
+    random_features.initialize_whitening_(samples, regularization=0.0)
+    transformed = samples @ random_features.geometry.transpose(-1, -2)
+    centered = transformed - transformed.mean(dim=(0, 1, 2), keepdim=True)
+    covariance = torch.einsum("bhld,bhle->de", centered, centered)
+    covariance = covariance / (samples.numel() // samples.shape[-1] - 1)
+
+    torch.testing.assert_close(covariance, torch.eye(2), rtol=2e-4, atol=2e-4)
+
+
+def test_low_rank_geometry_warns_and_rejects_whitening() -> None:
+    """Singular geometry is explicit about its theoretical limitation."""
+    with pytest.warns(UserWarning, match="importance-sampling interpretation"):
+        random_features = DataAwareRandomFeatures(
+            head_dim=4,
+            num_heads=1,
+            num_features=16,
+            rank=2,
+        )
+
+    with pytest.raises(ValueError, match="full-rank geometry"):
+        random_features.initialize_whitening_(torch.randn(2, 1, 8, 4))
+
+
 def test_covariance_is_positive_semidefinite() -> None:
     """A low-rank learned geometry always produces a PSD covariance."""
     torch.manual_seed(11)
-    random_features = DataAwareRandomFeatures(
-        head_dim=5,
-        num_heads=2,
-        num_features=16,
-        rank=3,
-    )
+    with pytest.warns(UserWarning, match="importance-sampling interpretation"):
+        random_features = DataAwareRandomFeatures(
+            head_dim=5,
+            num_heads=2,
+            num_features=16,
+            rank=3,
+        )
     with torch.no_grad():
         random_features.geometry.normal_()
 

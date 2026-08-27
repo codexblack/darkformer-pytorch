@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import warnings
 
 import torch
 from torch import nn
@@ -66,7 +67,7 @@ class DataAwareRandomFeatures(nn.Module):
       rank: Rank of the learned geometry. Defaults to ``head_dim``.
       per_head: Whether each head has an independent geometry.
       orthogonal: Whether to use Gaussian-orthogonal base projections.
-      eps: Positive offset added to feature values.
+      eps: Nonnegative offset added to feature values.
       projection_seed: Optional seed for projection initialization.
       deterministic: Whether to start with a fixed projection matrix.
     """
@@ -83,7 +84,7 @@ class DataAwareRandomFeatures(nn.Module):
         rank: int | None = None,
         per_head: bool = True,
         orthogonal: bool = False,
-        eps: float = 1e-6,
+        eps: float = 0.0,
         projection_seed: int | None = None,
         deterministic: bool = False,
     ) -> None:
@@ -97,8 +98,8 @@ class DataAwareRandomFeatures(nn.Module):
             raise ValueError("num_features must be positive")
         if not 1 <= rank <= head_dim:
             raise ValueError("rank must be in the interval [1, head_dim]")
-        if eps <= 0.0 or not math.isfinite(eps):
-            raise ValueError("eps must be finite and positive")
+        if eps < 0.0 or not math.isfinite(eps):
+            raise ValueError("eps must be finite and nonnegative")
 
         self.head_dim = head_dim
         self.num_heads = num_heads
@@ -108,6 +109,14 @@ class DataAwareRandomFeatures(nn.Module):
         self.orthogonal = orthogonal
         self.eps = float(eps)
         self.projection_seed = projection_seed
+
+        if rank < head_dim:
+            warnings.warn(
+                "rank-deficient geometry preserves the learned kernel estimator "
+                "but not the full-density importance-sampling interpretation",
+                UserWarning,
+                stacklevel=2,
+            )
 
         geometry_heads = num_heads if per_head else 1
         geometry = torch.empty(geometry_heads, rank, head_dim)
@@ -187,6 +196,159 @@ class DataAwareRandomFeatures(nn.Module):
         if not self.per_head:
             covariance = covariance.expand(self.num_heads, -1, -1)
         return covariance
+
+    def _validate_calibration_mask(
+        self,
+        name: str,
+        mask: torch.Tensor | None,
+        data: torch.Tensor,
+    ) -> None:
+        if mask is None:
+            return
+        expected_shape = (data.shape[0], data.shape[2])
+        if mask.dtype != torch.bool:
+            raise TypeError(f"{name} must have dtype torch.bool")
+        if mask.device != data.device:
+            raise ValueError(f"{name} must be on the same device as its data")
+        if tuple(mask.shape) != expected_shape:
+            raise ValueError(f"{name} must have shape {expected_shape}")
+
+    def _empirical_covariance(
+        self,
+        data: torch.Tensor,
+        mask: torch.Tensor | None,
+        *,
+        shared: bool,
+    ) -> tuple[torch.Tensor, int]:
+        self._validate_data(data)
+        if data.device != self.geometry.device:
+            raise ValueError("calibration data must share the geometry device")
+        accumulation_dtype = (
+            torch.float64 if data.dtype == torch.float64 else torch.float32
+        )
+        samples = data.to(accumulation_dtype)
+        if mask is None:
+            if shared:
+                count = data.shape[0] * data.shape[1] * data.shape[2]
+                mean = samples.mean(dim=(0, 1, 2), keepdim=True)
+            else:
+                count = data.shape[0] * data.shape[2]
+                mean = samples.mean(dim=(0, 2), keepdim=True)
+            centered = samples - mean
+        else:
+            count = int(mask.sum().item()) * (data.shape[1] if shared else 1)
+            weights = mask[:, None, :, None].to(accumulation_dtype)
+            dimensions = (0, 1, 2) if shared else (0, 2)
+            mean = (samples * weights).sum(
+                dim=dimensions,
+                keepdim=True,
+            ) / max(count, 1)
+            centered = (samples - mean) * weights
+        if count < 2:
+            raise ValueError("whitening requires at least two valid samples")
+        if shared:
+            covariance = torch.einsum(
+                "bhld,bhle->de",
+                centered,
+                centered,
+            ).unsqueeze(0)
+        else:
+            covariance = torch.einsum(
+                "bhld,bhle->hde",
+                centered,
+                centered,
+            )
+        covariance = covariance / (count - 1)
+        return covariance, count - 1
+
+    @torch.no_grad()
+    def initialize_whitening_(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        *,
+        query_mask: torch.Tensor | None = None,
+        key_mask: torch.Tensor | None = None,
+        regularization: float = 1e-4,
+        shrinkage: float = 0.0,
+    ) -> DataAwareRandomFeatures:
+        """Initialize geometry from empirical query and key covariance.
+
+        The full-rank geometry is set to the symmetric inverse square root of
+        the pooled within-query and within-key covariance. Regularization is
+        relative to the mean marginal variance.
+
+        Args:
+          query: Projected queries with shape `[batch, heads, length, head_dim]`.
+          key: Optional projected keys. When omitted, only queries are used.
+          query_mask: Valid query positions with shape `[batch, length]`.
+          key_mask: Valid key positions with shape `[batch, key_length]`.
+          regularization: Nonnegative diagonal loading relative to mean variance.
+          shrinkage: Weight assigned to an isotropic covariance target.
+
+        Returns:
+          This module.
+
+        Raises:
+          ValueError: Inputs are invalid or the geometry is rank deficient.
+        """
+        if self.rank != self.head_dim:
+            raise ValueError("whitening initialization requires full-rank geometry")
+        if regularization < 0.0 or not math.isfinite(regularization):
+            raise ValueError("regularization must be finite and nonnegative")
+        if not 0.0 <= shrinkage <= 1.0 or not math.isfinite(shrinkage):
+            raise ValueError("shrinkage must be finite and in [0, 1]")
+
+        self._validate_calibration_mask("query_mask", query_mask, query)
+        query_covariance, query_degrees = self._empirical_covariance(
+            query,
+            query_mask,
+            shared=not self.per_head,
+        )
+        covariance = query_covariance
+        degrees = query_degrees
+        if key is not None:
+            if key.device != query.device or key.dtype != query.dtype:
+                raise ValueError("query and key must share a device and dtype")
+            self._validate_calibration_mask("key_mask", key_mask, key)
+            key_covariance, key_degrees = self._empirical_covariance(
+                key,
+                key_mask,
+                shared=not self.per_head,
+            )
+            degrees += key_degrees
+            covariance = (
+                query_covariance * query_degrees + key_covariance * key_degrees
+            ) / degrees
+        elif key_mask is not None:
+            raise ValueError("key_mask requires key calibration data")
+
+        covariance = 0.5 * (covariance + covariance.transpose(-1, -2))
+        scale = covariance.diagonal(dim1=-2, dim2=-1).mean(dim=-1)
+        scale = scale.clamp_min(torch.finfo(covariance.dtype).eps)
+        identity = torch.eye(
+            self.head_dim,
+            device=covariance.device,
+            dtype=covariance.dtype,
+        ).expand(covariance.shape[0], -1, -1)
+        covariance = (
+            (1.0 - shrinkage) * covariance
+            + shrinkage * scale[:, None, None] * identity
+            + regularization * scale[:, None, None] * identity
+        )
+        eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        if bool((eigenvalues <= 0.0).any()):
+            raise ValueError(
+                "empirical covariance is not positive definite; increase "
+                "regularization or shrinkage"
+            )
+        inverse_root = (
+            eigenvectors
+            @ torch.diag_embed(eigenvalues.rsqrt())
+            @ eigenvectors.transpose(-1, -2)
+        )
+        self.geometry.copy_(inverse_root.to(self.geometry))
+        return self
 
     def _validate_inputs(
         self,
@@ -300,7 +462,12 @@ class DataAwareRandomFeatures(nn.Module):
         *,
         stabilize: bool = True,
     ) -> torch.Tensor:
-        """Map queries into the learned random-feature space."""
+        """Map queries into the learned random-feature space.
+
+        Stabilization rescales each query feature vector by a positive scalar.
+        This leaves normalized attention unchanged. Set ``stabilize=False``
+        when using feature inner products as an unbiased kernel estimator.
+        """
         self._validate_data(query)
         return self._feature_map(
             query,
@@ -316,7 +483,12 @@ class DataAwareRandomFeatures(nn.Module):
         key_mask: torch.Tensor | None = None,
         stabilize: bool = True,
     ) -> torch.Tensor:
-        """Map keys into the learned random-feature space."""
+        """Map keys into the learned random-feature space.
+
+        Stabilization applies one positive scale per batch and head. This leaves
+        normalized attention unchanged. Set ``stabilize=False`` when using
+        feature inner products as an unbiased kernel estimator.
+        """
         self._validate_data(key)
         if key_mask is not None:
             expected_shape = (key.shape[0], key.shape[2])

@@ -52,10 +52,7 @@ def _flash3_unavailable_reason(
     query_mask: torch.Tensor | None,
     key_mask: torch.Tensor | None,
     dropout_p: float,
-    deterministic: bool,
 ) -> str | None:
-    if deterministic:
-        return "deterministic execution is unsupported"
     if key_mask is not None:
         return "padding masks are unsupported"
     if dropout_p != 0.0:
@@ -176,6 +173,7 @@ def _run_flash3(
     value: torch.Tensor,
     causal: bool,
     scale: float,
+    deterministic: bool,
 ) -> torch.Tensor:
     output = function(
         query.transpose(1, 2),
@@ -183,6 +181,7 @@ def _run_flash3(
         value.transpose(1, 2),
         softmax_scale=scale,
         causal=causal,
+        deterministic=deterministic,
     )
     return output.transpose(1, 2)
 
@@ -366,12 +365,19 @@ def exact_attention(
             query_mask,
             dispatch_key_mask,
             dropout_p,
-            deterministic,
         )
         if flash3_reason is None:
             flash3, import_error = _load_flash3()
             if flash3 is not None:
-                output = _run_flash3(flash3, query, key, value, causal, scale)
+                output = _run_flash3(
+                    flash3,
+                    query,
+                    key,
+                    value,
+                    causal,
+                    scale,
+                    deterministic,
+                )
                 if query_mask is not None:
                     output = output.masked_fill(
                         ~query_mask[:, None, :, None],

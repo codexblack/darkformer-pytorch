@@ -228,6 +228,7 @@ def test_auto_prefers_flash3_and_converts_layout(
             torch.Size,
             float,
             bool,
+            bool,
         ]
     ] = []
 
@@ -238,6 +239,7 @@ def test_auto_prefers_flash3_and_converts_layout(
         *,
         softmax_scale: float,
         causal: bool,
+        deterministic: bool,
     ) -> torch.Tensor:
         calls.append(
             (
@@ -246,6 +248,7 @@ def test_auto_prefers_flash3_and_converts_layout(
                 flash_value.shape,
                 softmax_scale,
                 causal,
+                deterministic,
             )
         )
         return flash_value
@@ -278,6 +281,7 @@ def test_auto_prefers_flash3_and_converts_layout(
             torch.Size([2, 5, 3, 4]),
             0.25,
             True,
+            False,
         ),
     ]
     expected = value.masked_fill(~query_mask[:, None, :, None], 0.0)
@@ -300,7 +304,6 @@ def test_auto_ignores_an_all_true_key_mask_for_flash_dispatch(
         _query_mask: torch.Tensor | None,
         dispatched_key_mask: torch.Tensor | None,
         _dropout_p: float,
-        _deterministic: bool,
     ) -> None:
         received_masks.append(dispatched_key_mask)
 
@@ -311,8 +314,9 @@ def test_auto_ignores_an_all_true_key_mask_for_flash_dispatch(
         *,
         softmax_scale: float,
         causal: bool,
+        deterministic: bool,
     ) -> torch.Tensor:
-        del softmax_scale, causal
+        del softmax_scale, causal, deterministic
         return flash_value
 
     monkeypatch.setattr(backends, "_flash3_unavailable_reason", availability)
@@ -353,7 +357,7 @@ def test_cuda_version_requirement(
     assert backends._cuda_version_at_least(*minimum) is expected
 
 
-def test_auto_skips_flash3_deterministic_and_uses_flash2(
+def test_auto_passes_deterministic_to_flash3(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     query = torch.randn(1, 2, 3, 4)
@@ -361,32 +365,30 @@ def test_auto_skips_flash3_deterministic_and_uses_flash2(
     value = torch.randn_like(query)
     received: dict[str, object] = {}
 
-    def fake_flash2(
+    def fake_flash3(
         flash_query: torch.Tensor,
         flash_key: torch.Tensor,
         flash_value: torch.Tensor,
         *,
-        dropout_p: float,
         softmax_scale: float,
         causal: bool,
         deterministic: bool,
     ) -> torch.Tensor:
         received.update(
             shape=flash_query.shape,
-            dropout_p=dropout_p,
             softmax_scale=softmax_scale,
             causal=causal,
             deterministic=deterministic,
         )
         return flash_value
 
+    monkeypatch.setattr(backends, "_flash3_unavailable_reason", lambda *args: None)
+    monkeypatch.setattr(backends, "_load_flash3", lambda: (fake_flash3, None))
     monkeypatch.setattr(
         backends,
-        "_load_flash3",
-        lambda: pytest.fail("FlashAttention 3 should not be loaded"),
+        "_load_flash2",
+        lambda: pytest.fail("FlashAttention 2 should not be loaded"),
     )
-    monkeypatch.setattr(backends, "_flash2_unavailable_reason", lambda *args: None)
-    monkeypatch.setattr(backends, "_load_flash2", lambda: (fake_flash2, None))
 
     output = backends.exact_attention(
         query,
@@ -400,7 +402,6 @@ def test_auto_skips_flash3_deterministic_and_uses_flash2(
 
     assert received == {
         "shape": torch.Size([1, 3, 2, 4]),
-        "dropout_p": 0.0,
         "softmax_scale": 0.5,
         "causal": False,
         "deterministic": True,
@@ -448,26 +449,40 @@ def test_forced_flash_backend_reports_import_error(
         )
 
 
-def test_forced_flash3_rejects_deterministic_execution(
+def test_forced_flash3_passes_deterministic_argument(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tensor = torch.randn(1, 1, 2, 4)
-    monkeypatch.setattr(
-        backends,
-        "_load_flash3",
-        lambda: pytest.fail("FlashAttention 3 should not be loaded"),
+    received: list[bool] = []
+
+    def fake_flash3(
+        _query: torch.Tensor,
+        _key: torch.Tensor,
+        value: torch.Tensor,
+        *,
+        softmax_scale: float,
+        causal: bool,
+        deterministic: bool,
+    ) -> torch.Tensor:
+        del softmax_scale, causal
+        received.append(deterministic)
+        return value
+
+    monkeypatch.setattr(backends, "_flash3_unavailable_reason", lambda *args: None)
+    monkeypatch.setattr(backends, "_load_flash3", lambda: (fake_flash3, None))
+
+    output = backends.exact_attention(
+        tensor,
+        tensor,
+        tensor,
+        causal=False,
+        dropout_p=0.0,
+        backend="flash3",
+        deterministic=True,
     )
 
-    with pytest.raises(RuntimeError, match="deterministic execution is unsupported"):
-        backends.exact_attention(
-            tensor,
-            tensor,
-            tensor,
-            causal=False,
-            dropout_p=0.0,
-            backend="flash3",
-            deterministic=True,
-        )
+    assert received == [True]
+    torch.testing.assert_close(output, tensor)
 
 
 def test_rejects_causal_cross_attention() -> None:

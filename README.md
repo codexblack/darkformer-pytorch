@@ -4,13 +4,14 @@
 
 [![PyPI version](https://badge.fury.io/py/darkformer-pytorch.svg)](https://badge.fury.io/py/darkformer-pytorch)
 
-The `darkformer-pytorch` package provides a PyTorch implementation of the data-aware random feature
-kernel described in the [Data-Aware Random Feature Kernel for
-Transformers](https://arxiv.org/abs/2603.04127) paper by Google Deepmind. It follows the positive random
-feature formulation used by Performer while learning the projection geometry from
-data.
+The `darkformer-pytorch` package provides a PyTorch implementation of the
+data-aware random feature kernel described in the [Data-Aware Random Feature
+Kernel for Transformers](https://arxiv.org/abs/2603.04127) paper by Google
+DeepMind. It follows the positive random feature formulation used by Performer
+while learning the projection geometry from data.
 
-Inspiration was taken from lucidrain's [performer-pytorch](https://github.com/lucidrains/performer-pytorch) package to guide the implementation.
+The public API follows conventions from lucidrains'
+[performer-pytorch](https://github.com/lucidrains/performer-pytorch) package.
 
 ## Kernel
 
@@ -85,9 +86,10 @@ For development, install from the repository root:
 python -m pip install -e ".[dev]"
 ```
 
-PyTorch is the only runtime dependency. [FlashAttention](https://github.com/Dao-AILab/flash-attention)
-is optional and should be installed separately for a compatible CUDA, PyTorch,
-and GPU environment.
+PyTorch 2.4 or newer is the only runtime dependency.
+[FlashAttention](https://github.com/Dao-AILab/flash-attention) is optional and
+should be installed separately for a compatible CUDA, PyTorch, and GPU
+environment.
 
 ## Self-attention
 
@@ -120,9 +122,96 @@ The input and output shapes are $B \times L \times d$. A boolean `mask` has shap
 $B \times L$, where `True` marks a valid token. Causal attention combines the token
 mask with the causal constraint.
 
-Set `per_head_geometry=False` to share the learned geometry across heads. Set
-`orthogonal_features=False` to use independent Gaussian features instead of
-orthogonal Gaussian blocks.
+Independent Gaussian features are the default, matching Equation (3). Set
+`orthogonal_features=True` to use Performer-style orthogonal Gaussian blocks.
+The additive feature floor is disabled by default; set `eps` to a small positive
+value in linear mode when underflow protection is more important than the exact
+estimator. Exact and automatic modes require `eps=0` so both paths evaluate the
+same learned kernel.
+
+The stabilized public feature maps rescale features by factors that cancel during
+normalized attention. For direct kernel estimation with feature inner products,
+use `stabilize=False` and `eps=0` to retain the unbiased Equation (3) estimator.
+
+### Data-aware initialization
+
+The geometry starts at the identity when no calibration data is available. Before
+finetuning a pretrained model, it can instead be initialized from representative
+queries and keys. This optional initializer is a library feature based on the
+whitening construction in Proposition C.1. The paper does not specify covariance
+whitening as the initialization used in its experiments.
+
+The high-level attention initializers first apply the same $d_h^{-1/4}$ scaling
+used by the kernel. They estimate the pooled within-query and within-key covariance
+$\Lambda$ and set $M$ to a regularized symmetric $\Lambda^{-1/2}$. If queries and
+keys have the same covariance, as assumed by Proposition C.1, this gives
+
+```math
+\mathrm{Cov}(Mq)=\mathrm{Cov}(Mk)=I.
+```
+
+Here $q$ and $k$ denote the scaled kernel inputs. If their empirical covariances
+differ, the pooled estimate is a symmetric compromise and does not whiten both
+distributions exactly.
+
+Literal whitening does not preserve the pre-calibration attention temperature.
+If raw projected queries have covariance $\Lambda_0$, unregularized calibration
+sets
+
+```math
+M=d_h^{1/4}\Lambda_0^{-1/2},
+```
+
+so the calibrated score is $q_0^\mathsf{T}\Lambda_0^{-1}k_0$ rather than
+$q_0^\mathsf{T}\Lambda_0^{-1}k_0/\sqrt{d_h}$. Leave the identity initialization
+in place when a temperature-preserving start is more important than literal
+Proposition C.1 whitening.
+
+```python
+import torch
+
+from darkformer_pytorch import DarkformerLM
+
+model = DarkformerLM(
+    vocab_size=32_000,
+    dim=512,
+    depth=8,
+    heads=8,
+    num_features=256,
+    max_seq_len=4096,
+).to("cuda")
+
+calibration_tokens = torch.randint(
+    0,
+    32_000,
+    (8, 1024),
+    device="cuda",
+)
+
+model.initialize_whitening_(
+    calibration_tokens,
+    regularization=1e-4,
+    shrinkage=0.01,
+)
+```
+
+`SelfAttention.initialize_whitening_(inputs, mask=...)` and
+`CrossAttention.initialize_whitening_(inputs, context, ...)` provide the same
+calibration for standalone modules. `DarkformerKernelAttention` accepts already
+projected, unscaled tensors with shape $B \times H \times L \times d_h$ and applies
+the kernel scaling internally. `DataAwareRandomFeatures.initialize_whitening_`
+instead whitens the tensors passed directly to it without applying attention
+scaling.
+
+Full-rank geometry is required for whitening and for the density-ratio argument in
+Proposition 4.1. Setting `geometry_rank < head_dim` produces a singular covariance;
+the kernel estimator remains valid, but the full-density importance-sampling
+interpretation does not. Construction emits a warning for that configuration.
+Full configured rank is necessary but does not guarantee $\Sigma \succ 0$ throughout
+training because $M$ is unconstrained and can become singular. Set
+`per_head_geometry=False` to estimate one covariance shared by every head. The
+default estimates each head separately. Per-head geometry is a library extension;
+the paper's derivation treats one query-key distribution.
 
 ### Attention modes
 
@@ -213,7 +302,10 @@ attention.unfix_projection_matrices_()
 Fixed projections ignore ordinary manual and scheduled redraws. Pass `force=True`
 for an intentional one-time redraw while fixed. `projection_seed` makes initial
 projections reproducible independently of PyTorch's global random state.
-`deterministic=True` fixes projection matrices at construction.
+`deterministic=True` fixes projection matrices at construction. It also passes the
+backend deterministic flag to FlashAttention 2 and 3, while the SDPA fallback uses
+its math backend. Configure PyTorch's global deterministic settings separately when
+end-to-end determinism is required.
 
 For a scheduled training policy:
 
@@ -389,17 +481,39 @@ those inputs. A projection redraw is detected and rejected automatically.
 
 ## Benchmark
 
-The benchmark compares `linear`, `exact`, and `auto` modes using the public
-self-attention API. It does not import an optional FlashAttention package directly,
-so exact attention remains available through PyTorch on any supported installation.
+The synthetic microbenchmark compares PyTorch SDPA math, PyTorch's forced fused
+FlashAttention backend, Performer, and DARKformer on the same held-out
+anisotropic tensors. It measures kernel execution and does not reproduce the
+paper's model finetuning experiments.
+
+Performer and DARKformer use the same feature count, IID or orthogonal feature
+structure, projection seeds, and additive feature floor. Performer projections
+are injected explicitly instead of using its constructor defaults. DARKformer is
+whitened from a separate calibration sample, and calibration is excluded from
+timed regions. Performance rows report the median and IQR across repeated blocked
+timings. GPU memory is the incremental peak allocation during one warmed forward,
+not total process or model memory.
+
+Approximation error is measured in float32 over 30 projection seeds by default.
+Performer is compared with isotropic SDPA math. DARKformer is compared with exact
+Mahalanobis attention using the same calibrated geometry. These rows measure the
+finite-feature error against each method's target kernel; they are not a direct
+comparison of model quality.
 
 ```bash
+python -m pip install -e ".[benchmark]"
 python benchmarks/benchmark_attention.py --device cuda --dtype bfloat16
 ```
 
-Use `--exact-backend sdpa` for a PyTorch-only comparison. Run with `--help` to
-configure sequence lengths, feature count, model dimensions, masks, warmup, and
-measurement iterations.
+Raw measurements are written under the ignored `benchmark-results/` directory.
+The JSON records the method order, sequence lengths, error and calibration sizes,
+precision policy, feature controls, Git revision and dirty state, PyTorch and
+package versions, CUDA version, GPU, and NVIDIA driver. Only formatted tables and
+their exact configuration are committed here.
+
+<!-- benchmark-table:start -->
+Benchmark results will be added after the first reproducible GPU run.
+<!-- benchmark-table:end -->
 
 ## References
 ```bibtex

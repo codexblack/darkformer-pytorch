@@ -115,6 +115,9 @@ class DarkformerBlock(nn.Module):
         feature_redraw_interval: int | None,
         projection_seed: int | None,
         deterministic: bool,
+        per_head_geometry: bool = True,
+        orthogonal_features: bool = False,
+        eps: float = 0.0,
     ) -> None:
         super().__init__()
         self.self_norm = nn.RMSNorm(dim)
@@ -124,6 +127,8 @@ class DarkformerBlock(nn.Module):
             head_dim=head_dim,
             num_features=num_features,
             geometry_rank=geometry_rank,
+            per_head_geometry=per_head_geometry,
+            orthogonal_features=orthogonal_features,
             causal=causal,
             attention_mode=attention_mode,
             exact_threshold=exact_threshold,
@@ -135,6 +140,7 @@ class DarkformerBlock(nn.Module):
             feature_redraw_interval=feature_redraw_interval,
             projection_seed=projection_seed,
             deterministic=deterministic,
+            eps=eps,
         )
         self.cross_norm = nn.RMSNorm(dim) if cross_attend else None
         self.cross_attention = (
@@ -144,6 +150,8 @@ class DarkformerBlock(nn.Module):
                 head_dim=head_dim,
                 num_features=num_features,
                 geometry_rank=geometry_rank,
+                per_head_geometry=per_head_geometry,
+                orthogonal_features=orthogonal_features,
                 attention_mode=attention_mode,
                 exact_threshold=exact_threshold,
                 exact_backend=exact_backend,
@@ -154,6 +162,7 @@ class DarkformerBlock(nn.Module):
                     None if projection_seed is None else projection_seed + 1
                 ),
                 deterministic=deterministic,
+                eps=eps,
             )
             if cross_attend
             else None
@@ -182,6 +191,46 @@ class DarkformerBlock(nn.Module):
             )
         inputs = inputs + self.feed_forward(self.feed_forward_norm(inputs))
         return inputs
+
+    @torch.no_grad()
+    def initialize_whitening_(
+        self,
+        inputs: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
+        regularization: float = 1e-4,
+        shrinkage: float = 0.0,
+    ) -> torch.Tensor:
+        """Calibrate this block and return inputs for the next block."""
+        normalized = self.self_norm(inputs)
+        self.self_attention.initialize_whitening_(
+            normalized,
+            mask=mask,
+            regularization=regularization,
+            shrinkage=shrinkage,
+        )
+        inputs = inputs + self.self_attention(normalized, mask=mask)
+        if self.cross_attention is not None:
+            if context is None or self.cross_norm is None:
+                raise ValueError("context is required when cross_attend=True")
+            normalized = self.cross_norm(inputs)
+            self.cross_attention.initialize_whitening_(
+                normalized,
+                context,
+                mask=mask,
+                context_mask=context_mask,
+                regularization=regularization,
+                shrinkage=shrinkage,
+            )
+            inputs = inputs + self.cross_attention(
+                normalized,
+                context,
+                mask=mask,
+                context_mask=context_mask,
+            )
+        return inputs + self.feed_forward(self.feed_forward_norm(inputs))
 
     def forward_with_state(
         self,
@@ -239,6 +288,8 @@ class Darkformer(nn.Module):
         head_dim: int | None = None,
         num_features: int | None = None,
         geometry_rank: int | None = None,
+        per_head_geometry: bool = True,
+        orthogonal_features: bool = False,
         mlp_dim: int | None = None,
         causal: bool = False,
         cross_attend: bool = False,
@@ -252,6 +303,7 @@ class Darkformer(nn.Module):
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
         deterministic: bool = False,
+        eps: float = 0.0,
     ) -> None:
         super().__init__()
         if dim < 1 or depth < 1:
@@ -289,6 +341,9 @@ class Darkformer(nn.Module):
                     feature_redraw_interval=feature_redraw_interval,
                     projection_seed=layer_seed,
                     deterministic=deterministic,
+                    per_head_geometry=per_head_geometry,
+                    orthogonal_features=orthogonal_features,
+                    eps=eps,
                 )
             )
         self.layers = nn.ModuleList(layers)
@@ -325,6 +380,35 @@ class Darkformer(nn.Module):
         """Enable projection redraws in every layer."""
         for attention in self._attention_modules():
             attention.unfix_projection_matrices_()
+        return self
+
+    @torch.no_grad()
+    def initialize_whitening_(
+        self,
+        inputs: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
+        regularization: float = 1e-4,
+        shrinkage: float = 0.0,
+    ) -> Darkformer:
+        """Calibrate every attention geometry on representative activations."""
+        was_training = self.training
+        self.eval()
+        try:
+            for module in self.layers:
+                layer = cast(DarkformerBlock, module)
+                inputs = layer.initialize_whitening_(
+                    inputs,
+                    mask=mask,
+                    context=context,
+                    context_mask=context_mask,
+                    regularization=regularization,
+                    shrinkage=shrinkage,
+                )
+        finally:
+            self.train(was_training)
         return self
 
     def forward(
@@ -410,6 +494,8 @@ class DarkformerLM(nn.Module):
         head_dim: int | None = None,
         num_features: int | None = None,
         geometry_rank: int | None = None,
+        per_head_geometry: bool = True,
+        orthogonal_features: bool = False,
         mlp_dim: int | None = None,
         max_seq_len: int | None = None,
         causal: bool = True,
@@ -424,6 +510,7 @@ class DarkformerLM(nn.Module):
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
         deterministic: bool = False,
+        eps: float = 0.0,
     ) -> None:
         super().__init__()
         if vocab_size < 1:
@@ -442,6 +529,8 @@ class DarkformerLM(nn.Module):
             head_dim=head_dim,
             num_features=num_features,
             geometry_rank=geometry_rank,
+            per_head_geometry=per_head_geometry,
+            orthogonal_features=orthogonal_features,
             mlp_dim=mlp_dim,
             causal=causal,
             cross_attend=False,
@@ -455,6 +544,7 @@ class DarkformerLM(nn.Module):
             feature_redraw_interval=feature_redraw_interval,
             projection_seed=projection_seed,
             deterministic=deterministic,
+            eps=eps,
         )
         self.final_norm = nn.RMSNorm(dim)
         self.output_projection = nn.Linear(dim, vocab_size, bias=False)
@@ -489,6 +579,25 @@ class DarkformerLM(nn.Module):
     def unfix_projection_matrices_(self) -> DarkformerLM:
         """Enable projection redraws in every layer."""
         self.transformer.unfix_projection_matrices_()
+        return self
+
+    @torch.no_grad()
+    def initialize_whitening_(
+        self,
+        tokens: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
+        regularization: float = 1e-4,
+        shrinkage: float = 0.0,
+    ) -> DarkformerLM:
+        """Calibrate all attention geometries on representative tokens."""
+        self._validate_tokens(tokens, "tokens")
+        self.transformer.initialize_whitening_(
+            self.token_embedding(tokens),
+            mask=mask,
+            regularization=regularization,
+            shrinkage=shrinkage,
+        )
         return self
 
     def forward_features(
@@ -651,6 +760,8 @@ class DarkformerEncDec(nn.Module):
         head_dim: int | None = None,
         num_features: int | None = None,
         geometry_rank: int | None = None,
+        per_head_geometry: bool = True,
+        orthogonal_features: bool = False,
         mlp_dim: int | None = None,
         max_source_length: int | None = None,
         max_target_length: int | None = None,
@@ -665,6 +776,7 @@ class DarkformerEncDec(nn.Module):
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
         deterministic: bool = False,
+        eps: float = 0.0,
     ) -> None:
         super().__init__()
         if min(source_vocab_size, target_vocab_size) < 1:
@@ -698,6 +810,8 @@ class DarkformerEncDec(nn.Module):
             head_dim=head_dim,
             num_features=num_features,
             geometry_rank=geometry_rank,
+            per_head_geometry=per_head_geometry,
+            orthogonal_features=orthogonal_features,
             mlp_dim=mlp_dim,
             causal=False,
             cross_attend=False,
@@ -711,6 +825,7 @@ class DarkformerEncDec(nn.Module):
             feature_redraw_interval=feature_redraw_interval,
             projection_seed=projection_seed,
             deterministic=deterministic,
+            eps=eps,
         )
         decoder_seed = (
             None if projection_seed is None else projection_seed + 2 * encoder_depth
@@ -722,6 +837,8 @@ class DarkformerEncDec(nn.Module):
             head_dim=head_dim,
             num_features=num_features,
             geometry_rank=geometry_rank,
+            per_head_geometry=per_head_geometry,
+            orthogonal_features=orthogonal_features,
             mlp_dim=mlp_dim,
             causal=True,
             cross_attend=True,
@@ -735,6 +852,7 @@ class DarkformerEncDec(nn.Module):
             feature_redraw_interval=feature_redraw_interval,
             projection_seed=decoder_seed,
             deterministic=deterministic,
+            eps=eps,
         )
         self.encoder_norm = nn.RMSNorm(dim)
         self.decoder_norm = nn.RMSNorm(dim)
@@ -770,6 +888,51 @@ class DarkformerEncDec(nn.Module):
         """Disable all encoder and decoder projection redraws."""
         self.encoder.fix_projection_matrices_()
         self.decoder.fix_projection_matrices_()
+        return self
+
+    @torch.no_grad()
+    def initialize_whitening_(
+        self,
+        source_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+        *,
+        source_mask: torch.Tensor | None = None,
+        target_mask: torch.Tensor | None = None,
+        regularization: float = 1e-4,
+        shrinkage: float = 0.0,
+    ) -> DarkformerEncDec:
+        """Calibrate encoder and decoder geometries on representative tokens."""
+        was_training = self.training
+        self.eval()
+        try:
+            self._validate_tokens(
+                source_tokens,
+                name="source_tokens",
+                max_length=self.max_source_length,
+            )
+            self._validate_tokens(
+                target_tokens,
+                name="target_tokens",
+                max_length=self.max_target_length,
+            )
+            source = self.source_embedding(source_tokens)
+            self.encoder.initialize_whitening_(
+                source,
+                mask=source_mask,
+                regularization=regularization,
+                shrinkage=shrinkage,
+            )
+            context = self.encoder_norm(self.encoder(source, mask=source_mask))
+            self.decoder.initialize_whitening_(
+                self.target_embedding(target_tokens),
+                mask=target_mask,
+                context=context,
+                context_mask=source_mask,
+                regularization=regularization,
+                shrinkage=shrinkage,
+            )
+        finally:
+            self.train(was_training)
         return self
 
     def unfix_projection_matrices_(self) -> DarkformerEncDec:

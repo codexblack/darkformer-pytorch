@@ -172,6 +172,49 @@ def test_exact_mode_matches_transformed_softmax_attention() -> None:
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
+def test_whitening_calibrates_effective_kernel_inputs() -> None:
+    """Kernel-level calibration whitens inputs after attention scaling."""
+    generator = torch.Generator().manual_seed(21)
+    head_dim = 4
+    heads = 2
+    attention = DarkformerKernelAttention(
+        head_dim=head_dim,
+        num_heads=heads,
+        num_features=8,
+        deterministic=True,
+    ).double()
+    mixing = torch.tensor(
+        [
+            [2.0, 0.0, 0.0, 0.0],
+            [0.4, 1.5, 0.0, 0.0],
+            [0.0, -0.3, 0.8, 0.0],
+            [0.2, 0.0, 0.1, 0.5],
+        ],
+        dtype=torch.float64,
+    )
+    query = (
+        torch.randn(
+            3,
+            heads,
+            64,
+            head_dim,
+            generator=generator,
+            dtype=torch.float64,
+        )
+        @ mixing
+    )
+
+    attention.initialize_whitening_(query, regularization=0.0)
+    transformed, _ = attention._transformed_query_key(query, query)
+    centered = transformed - transformed.mean(dim=(0, 2), keepdim=True)
+    covariance = torch.einsum("bhld,bhle->hde", centered, centered) / (
+        query.shape[0] * query.shape[2] - 1
+    )
+    identity = torch.eye(head_dim, dtype=query.dtype).expand(heads, -1, -1)
+
+    torch.testing.assert_close(covariance, identity, rtol=1e-9, atol=1e-9)
+
+
 def test_auto_mode_routes_around_threshold(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -222,6 +265,20 @@ def test_auto_mode_routes_around_threshold(
 
     assert calls == [(2, 3)]
     assert long_output.shape == (1, 1, 4, 2)
+
+
+@pytest.mark.parametrize("attention_mode", ["auto", "exact"])
+def test_positive_eps_requires_linear_mode(
+    attention_mode: attention_module.AttentionMode,
+) -> None:
+    """A feature floor cannot change semantics across attention modes."""
+    with pytest.raises(ValueError, match="eps must be zero"):
+        DarkformerKernelAttention(
+            head_dim=4,
+            num_heads=1,
+            attention_mode=attention_mode,
+            eps=1e-6,
+        )
 
 
 def test_exact_mode_does_not_redraw_unused_features() -> None:
@@ -490,6 +547,46 @@ def test_causal_state_rejects_projection_redraw() -> None:
             tensor[:, :, :1],
             state=state,
         )
+
+
+def test_causal_state_rejects_whitening_change() -> None:
+    """A causal state cannot outlive its attention geometry."""
+    attention = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        causal=True,
+        deterministic=True,
+    )
+    tensor = torch.randn(1, 1, 3, 4)
+    _, state = attention.forward_with_state(tensor, tensor, tensor)
+
+    attention.initialize_whitening_(tensor, tensor)
+
+    with pytest.raises(RuntimeError, match="attention geometry"):
+        attention.forward_with_state(
+            tensor[:, :, :1],
+            tensor[:, :, :1],
+            tensor[:, :, :1],
+            state=state,
+        )
+
+
+def test_context_state_rejects_whitening_change() -> None:
+    """A context state cannot outlive its attention geometry."""
+    attention = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        deterministic=True,
+    )
+    query = torch.randn(1, 1, 2, 4)
+    key = torch.randn(1, 1, 3, 4)
+    value = torch.randn(1, 1, 3, 5)
+    state = attention.build_context_state(key, value)
+
+    attention.initialize_whitening_(query, key)
+
+    with pytest.raises(RuntimeError, match="attention geometry"):
+        attention.forward_with_context_state(query, state)
 
 
 def test_context_state_matches_cross_attention() -> None:

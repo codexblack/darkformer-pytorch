@@ -48,6 +48,7 @@ def _encoder_decoder(
     deterministic: bool = True,
     attention_mode: AttentionMode = "linear",
     rotary: bool = False,
+    dropout: float = 0.0,
 ) -> DarkformerEncDec:
     return DarkformerEncDec(
         source_vocab_size=17,
@@ -61,7 +62,7 @@ def _encoder_decoder(
         max_source_length=8,
         max_target_length=8,
         attention_mode=attention_mode,
-        dropout=0.0,
+        dropout=dropout,
         rotary=rotary,
         causal_chunk_size=2,
         projection_seed=23,
@@ -452,3 +453,89 @@ def test_encoder_decoder_projection_controls_reach_all_attention() -> None:
     model = _encoder_decoder(deterministic=False)
 
     _assert_projection_controls(model, expected_modules=3)
+
+
+def test_model_defaults_use_paper_feature_estimator() -> None:
+    """Model constructors propagate IID features and a zero feature floor."""
+    model = _language_model(depth=2)
+
+    for random_features in _random_feature_modules(model):
+        assert not random_features.orthogonal
+        assert random_features.eps == 0.0
+
+
+def test_language_model_whitening_calibrates_all_layers() -> None:
+    """Representative tokens initialize every language-model geometry."""
+    model = _language_model(depth=2, max_seq_len=8)
+    tokens = torch.randint(0, model.vocab_size, (4, 8))
+    modules = _random_feature_modules(model)
+    initial = [module.geometry.detach().clone() for module in modules]
+
+    model.initialize_whitening_(tokens, regularization=1e-3)
+
+    assert model.training
+    for module, original in zip(modules, initial, strict=True):
+        assert not torch.equal(module.geometry, original)
+
+
+def test_encoder_decoder_whitening_uses_normalized_context() -> None:
+    """Decoder calibration receives the same context used for inference."""
+    model = _encoder_decoder()
+    source_tokens = torch.randint(0, model.source_vocab_size, (4, 8))
+    target_tokens = torch.randint(0, model.target_vocab_size, (4, 8))
+
+    with mock.patch.object(
+        model.decoder,
+        "initialize_whitening_",
+        wraps=model.decoder.initialize_whitening_,
+    ) as decoder_initializer:
+        model.initialize_whitening_(source_tokens, target_tokens)
+
+    context = decoder_initializer.call_args.kwargs["context"]
+    expected = model.encode(source_tokens)
+    unnormalized = model.encoder(model.source_embedding(source_tokens))
+    torch.testing.assert_close(context, expected)
+    assert not torch.allclose(context, unnormalized)
+
+
+@pytest.mark.parametrize("training", [True, False])
+def test_encoder_decoder_whitening_restores_mode_after_error(training: bool) -> None:
+    """Calibration restores the original mode when a later stage fails."""
+    model = _encoder_decoder()
+    model.train(training)
+    source_tokens = torch.randint(0, model.source_vocab_size, (4, 8))
+    target_tokens = torch.randint(0, model.target_vocab_size, (4, 8))
+
+    with (
+        mock.patch.object(
+            model.decoder,
+            "initialize_whitening_",
+            side_effect=RuntimeError("calibration failed"),
+        ),
+        pytest.raises(RuntimeError, match="calibration failed"),
+    ):
+        model.initialize_whitening_(source_tokens, target_tokens)
+
+    assert model.training is training
+
+
+def test_encoder_decoder_whitening_is_deterministic_with_dropout() -> None:
+    """Calibration disables dropout for every encoder-decoder stage."""
+    model = _encoder_decoder(dropout=0.75)
+    model.train()
+    source_tokens = torch.randint(0, model.source_vocab_size, (4, 8))
+    target_tokens = torch.randint(0, model.target_vocab_size, (4, 8))
+
+    model.initialize_whitening_(source_tokens, target_tokens)
+    first = [
+        module.geometry.detach().clone() for module in _random_feature_modules(model)
+    ]
+    torch.randn(128)
+    model.initialize_whitening_(source_tokens, target_tokens)
+    second = [
+        module.geometry.detach().clone() for module in _random_feature_modules(model)
+    ]
+
+    assert model.training
+    for before, after in zip(first, second, strict=True):
+        torch.testing.assert_close(before, after, rtol=0, atol=0)

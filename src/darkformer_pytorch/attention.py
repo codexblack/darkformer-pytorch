@@ -203,13 +203,13 @@ class DarkformerKernelAttention(nn.Module):
         num_features: int | None = None,
         geometry_rank: int | None = None,
         per_head_geometry: bool = True,
-        orthogonal_features: bool = True,
+        orthogonal_features: bool = False,
         causal: bool = False,
         attention_mode: AttentionMode = "linear",
         exact_threshold: int | None = None,
         exact_backend: AttentionBackend = "auto",
         causal_chunk_size: int = 64,
-        eps: float = 1e-6,
+        eps: float = 0.0,
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
         deterministic: bool = False,
@@ -220,6 +220,8 @@ class DarkformerKernelAttention(nn.Module):
         )
         if attention_mode not in ("linear", "auto", "exact"):
             raise ValueError(f"unknown attention mode: {attention_mode!r}")
+        if eps > 0.0 and attention_mode != "linear":
+            raise ValueError("eps must be zero unless attention_mode='linear'")
         if exact_threshold is not None and exact_threshold < 1:
             raise ValueError("exact_threshold must be positive")
         if causal_chunk_size < 1:
@@ -278,6 +280,29 @@ class DarkformerKernelAttention(nn.Module):
     def covariance(self) -> torch.Tensor:
         """Return the attention covariance for every head."""
         return self.random_features.covariance()
+
+    def initialize_whitening_(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        *,
+        query_mask: torch.Tensor | None = None,
+        key_mask: torch.Tensor | None = None,
+        regularization: float = 1e-4,
+        shrinkage: float = 0.0,
+    ) -> DarkformerKernelAttention:
+        """Whiten the scaled query and key inputs used by the attention kernel."""
+        normalizer = self.head_dim**-0.25
+        self.random_features.initialize_whitening_(
+            query * normalizer,
+            None if key is None else key * normalizer,
+            query_mask=query_mask,
+            key_mask=key_mask,
+            regularization=regularization,
+            shrinkage=shrinkage,
+        )
+        self._projection_version += 1
+        return self
 
     def _redraw_generator(self) -> torch.Generator:
         device = self.random_features.projection_matrix.device
@@ -490,7 +515,8 @@ class DarkformerKernelAttention(nn.Module):
                 raise ValueError("state.sequence_length must be nonnegative")
             if state.projection_version != self._projection_version:
                 raise RuntimeError(
-                    "projection matrices changed after the state was created"
+                    "attention geometry or projection matrices changed after the "
+                    "state was created"
                 )
             key_state = state.key_sum
             key_value_state = state.key_value_sum
@@ -679,7 +705,8 @@ class DarkformerKernelAttention(nn.Module):
             raise ValueError("state.context_length must be positive")
         if state.projection_version != self._projection_version:
             raise RuntimeError(
-                "projection matrices changed after the state was created"
+                "attention geometry or projection matrices changed after the "
+                "state was created"
             )
         expected_key_shape = (query.shape[0], self.num_heads, self.num_features)
         if tuple(state.key_sum.shape) != expected_key_shape:
@@ -783,7 +810,7 @@ class SelfAttention(nn.Module):
         num_features: int | None = None,
         geometry_rank: int | None = None,
         per_head_geometry: bool = True,
-        orthogonal_features: bool = True,
+        orthogonal_features: bool = False,
         causal: bool = False,
         attention_mode: AttentionMode = "linear",
         exact_threshold: int | None = None,
@@ -794,7 +821,7 @@ class SelfAttention(nn.Module):
         rotary: bool = False,
         rotary_base: float = 10_000.0,
         causal_chunk_size: int = 64,
-        eps: float = 1e-6,
+        eps: float = 0.0,
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
         deterministic: bool = False,
@@ -843,6 +870,29 @@ class SelfAttention(nn.Module):
     def covariance(self) -> torch.Tensor:
         """Return the attention covariance for every head."""
         return self.attention.covariance()
+
+    @torch.no_grad()
+    def initialize_whitening_(
+        self,
+        inputs: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
+        regularization: float = 1e-4,
+        shrinkage: float = 0.0,
+    ) -> SelfAttention:
+        """Initialize geometry from projected queries and keys for sample inputs."""
+        query, key, _ = self._project_inputs(inputs)
+        if self.rotary is not None:
+            query, key = self.rotary(query, key)
+        self.attention.initialize_whitening_(
+            query,
+            key,
+            query_mask=mask,
+            key_mask=mask,
+            regularization=regularization,
+            shrinkage=shrinkage,
+        )
+        return self
 
     def redraw_projection_matrices_(self, *, force: bool = False) -> SelfAttention:
         """Redraw the random-feature basis in place."""
@@ -942,7 +992,7 @@ class CrossAttention(nn.Module):
         num_features: int | None = None,
         geometry_rank: int | None = None,
         per_head_geometry: bool = True,
-        orthogonal_features: bool = True,
+        orthogonal_features: bool = False,
         attention_mode: AttentionMode = "linear",
         exact_threshold: int | None = None,
         exact_backend: AttentionBackend = "auto",
@@ -950,7 +1000,7 @@ class CrossAttention(nn.Module):
         qkv_bias: bool = False,
         output_bias: bool = True,
         causal_chunk_size: int = 64,
-        eps: float = 1e-6,
+        eps: float = 0.0,
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
         deterministic: bool = False,
@@ -1005,6 +1055,32 @@ class CrossAttention(nn.Module):
     def covariance(self) -> torch.Tensor:
         """Return the attention covariance for every head."""
         return self.attention.covariance()
+
+    @torch.no_grad()
+    def initialize_whitening_(
+        self,
+        inputs: torch.Tensor,
+        context: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
+        regularization: float = 1e-4,
+        shrinkage: float = 0.0,
+    ) -> CrossAttention:
+        """Initialize geometry from sample cross-attention queries and keys."""
+        query = self._project_query(inputs)
+        key, _ = self._project_context(context)
+        if inputs.shape[0] != context.shape[0]:
+            raise ValueError("inputs and context batch sizes must match")
+        self.attention.initialize_whitening_(
+            query,
+            key,
+            query_mask=mask,
+            key_mask=context_mask,
+            regularization=regularization,
+            shrinkage=shrinkage,
+        )
+        return self
 
     def redraw_projection_matrices_(self, *, force: bool = False) -> CrossAttention:
         """Redraw the random-feature basis in place."""
