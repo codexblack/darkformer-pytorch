@@ -53,6 +53,7 @@ class PerformanceResult:
     accumulation_precision: str
     latency_median_ms: float | None
     latency_iqr_ms: float | None
+    latency_repeat_medians_ms: list[float]
     tokens_per_second: float | None
     incremental_peak_memory_mib: float | None
     timing_blocks: int
@@ -68,6 +69,7 @@ class ErrorResult:
     reference: str
     relative_l2_median: float | None
     relative_l2_iqr: float | None
+    relative_l2_samples: list[float]
     projection_seeds: int
     status: str
 
@@ -484,6 +486,7 @@ def _measure(
             accumulation_precision=method.accumulation_precision,
             latency_median_ms=seconds * 1_000.0,
             latency_iqr_ms=seconds_iqr * 1_000.0,
+            latency_repeat_medians_ms=[repeat * 1_000.0 for repeat in repeat_medians],
             tokens_per_second=batch_size * sequence_length / seconds,
             incremental_peak_memory_mib=incremental_peak_memory_mib,
             timing_blocks=timing_blocks,
@@ -498,6 +501,7 @@ def _measure(
             accumulation_precision=method.accumulation_precision,
             latency_median_ms=None,
             latency_iqr_ms=None,
+            latency_repeat_medians_ms=[],
             tokens_per_second=None,
             incremental_peak_memory_mib=None,
             timing_blocks=0,
@@ -640,6 +644,7 @@ def _error_result(
             reference=reference_name,
             relative_l2_median=median,
             relative_l2_iqr=iqr,
+            relative_l2_samples=errors,
             projection_seeds=1 if method_name == "sdpa-flash" else seeds,
             status="ok",
         )
@@ -650,6 +655,7 @@ def _error_result(
             reference=reference_name,
             relative_l2_median=None,
             relative_l2_iqr=None,
+            relative_l2_samples=[],
             projection_seeds=0,
             status=_failure_status(error),
         )
@@ -1040,6 +1046,7 @@ def main() -> None:
                     accumulation_precision="unavailable",
                     latency_median_ms=None,
                     latency_iqr_ms=None,
+                    latency_repeat_medians_ms=[],
                     tokens_per_second=None,
                     incremental_peak_memory_mib=None,
                     timing_blocks=0,
