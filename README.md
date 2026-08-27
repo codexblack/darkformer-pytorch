@@ -2,7 +2,7 @@
 
 # Data-Aware Random Feature Kernels for Transformers (DARKformer)
 
-[![PyPI version](https://badge.fury.io/py/darkformer-pytorch.svg)](https://badge.fury.io/py/darkformer-pytorch)
+[![PyPI version](https://flat.badgen.net/pypi/v/darkformer-pytorch)](https://pypi.org/project/darkformer-pytorch/)
 
 The `darkformer-pytorch` package provides a PyTorch implementation of the
 data-aware random feature kernel described in the [Data-Aware Random Feature
