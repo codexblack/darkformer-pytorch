@@ -512,7 +512,54 @@ package versions, CUDA version, GPU, and NVIDIA driver. Only formatted tables an
 their exact configuration are committed here.
 
 <!-- benchmark-table:start -->
-Benchmark results will be added after the first reproducible GPU run.
+Results from commit `e6202ec` on 2026-08-27 are shown below. The system used an
+NVIDIA GeForce RTX 4070 Ti (compute capability 8.9), driver 610.47, CUDA 13.0,
+PyTorch 2.12.0+cu130, Python 3.12.13, `performer-pytorch` 1.1.4, and
+`darkformer-pytorch` 0.1.1.
+
+The noncausal workload used batch size 1, 8 heads, head dimension 64, 256 IID
+features, `eps=0`, data seed 17, and projection seed 1,000. Query and key inputs
+had covariance condition number 16. DARKformer used a disjoint length-512
+calibration sample with regularization $10^{-4}$ and shrinkage $0.01$.
+Performance inputs used bfloat16. Performer kept bfloat16 features and
+reductions; DARKformer used bfloat16 projections with float32 features and
+reductions. Each latency is the median of five blocked timing repeats after
+three warmups; the value in parentheses is the IQR. Every timing repeat ran for
+at least 0.25 seconds. Memory is the incremental peak CUDA allocation during one
+warmed forward.
+
+| Sequence | Method | Median latency, ms (IQR) | Tokens/s | Peak MiB |
+| ---: | :--- | ---: | ---: | ---: |
+| 512 | SDPA math | 0.163 (0.001) | 3,139,938 | 22.0 |
+| 512 | Performer | 0.623 (0.014) | 822,079 | 8.0 |
+| 512 | DARKformer | 0.730 (0.007) | 701,570 | 16.0 |
+| 1,024 | SDPA math | 0.512 (0.001) | 2,000,426 | 80.0 |
+| 1,024 | Performer | 0.620 (0.012) | 1,652,909 | 24.0 |
+| 1,024 | DARKformer | 0.738 (0.002) | 1,387,526 | 34.0 |
+| 2,048 | SDPA math | 2.919 (0.018) | 701,627 | 304.0 |
+| 2,048 | Performer | 0.596 (0.009) | 3,434,997 | 48.0 |
+| 2,048 | DARKformer | 0.695 (0.008) | 2,946,966 | 68.0 |
+| 4,096 | SDPA math | 11.363 (0.015) | 360,481 | 1,184.0 |
+| 4,096 | Performer | 0.585 (0.014) | 7,007,519 | 78.0 |
+| 4,096 | DARKformer | 1.967 (0.070) | 2,082,359 | 128.0 |
+
+The forced PyTorch fused-SDPA method was unavailable because this PyTorch build
+was not compiled with FlashAttention. No fallback value is reported for that
+method. On this workload, DARKformer crossed math SDPA between 1,024 and 2,048
+tokens. At 4,096 tokens, its median latency was 5.78 times lower and its
+incremental peak allocation was 9.25 times lower than math SDPA.
+
+Approximation error used separate float32 tensors of length 512 and a separate
+calibration sample. Results cover 30 projection seeds starting at 1,000; values
+are median relative L2 error with IQR in parentheses.
+
+| Method | Reference | Relative L2 error (IQR) |
+| :--- | :--- | ---: |
+| Performer | Isotropic softmax, SDPA math | 2.507232 (0.229741) |
+| DARKformer | Exact held-out calibrated Mahalanobis attention | 1.364384 (0.007816) |
+
+The error rows use different target kernels and are not directly comparable.
+They measure random-feature approximation error, not downstream model quality.
 <!-- benchmark-table:end -->
 
 ## References
