@@ -62,7 +62,7 @@ def _normalize_attention(
     numerator: torch.Tensor,
     denominator: torch.Tensor,
 ) -> torch.Tensor:
-    valid = denominator > 0.0
+    valid = denominator > torch.finfo(denominator.dtype).tiny
     output = numerator / torch.where(valid, denominator, 1.0)[..., None]
     return torch.where(valid[..., None], output, 0.0)
 
@@ -190,9 +190,11 @@ class DarkformerKernelAttention(nn.Module):
     """Data-aware attention over projected queries, keys, and values."""
 
     _calls_since_redraw: torch.Tensor
+    _calls_since_redraw_value: int
+    _projection_version: torch.Tensor
+    _projection_version_value: int
     _redraw_count: torch.Tensor
     _redraw_seed: torch.Tensor
-    _projection_version: int
     random_features: DataAwareRandomFeatures
 
     def __init__(
@@ -213,6 +215,8 @@ class DarkformerKernelAttention(nn.Module):
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
         deterministic: bool = False,
+        fixed_projection: bool | None = None,
+        backend_deterministic: bool | None = None,
     ) -> None:
         super().__init__()
         num_features = (
@@ -222,6 +226,10 @@ class DarkformerKernelAttention(nn.Module):
             raise ValueError(f"unknown attention mode: {attention_mode!r}")
         if eps > 0.0 and attention_mode != "linear":
             raise ValueError("eps must be zero unless attention_mode='linear'")
+        if attention_mode == "auto" and exact_threshold is None:
+            raise ValueError(
+                "exact_threshold is required when attention_mode='auto'"
+            )
         if exact_threshold is not None and exact_threshold < 1:
             raise ValueError("exact_threshold must be positive")
         if causal_chunk_size < 1:
@@ -234,16 +242,19 @@ class DarkformerKernelAttention(nn.Module):
         self.num_features = num_features
         self.causal = causal
         self.attention_mode = attention_mode
-        self.exact_threshold = (
-            num_features if exact_threshold is None else exact_threshold
-        )
+        self.exact_threshold = exact_threshold
         self.exact_backend = exact_backend
         self.causal_chunk_size = causal_chunk_size
         self.eps = float(eps)
         self.feature_redraw_interval = feature_redraw_interval
         self.projection_seed = projection_seed
+        self.fixed_projection = (
+            deterministic if fixed_projection is None else fixed_projection
+        )
+        self.backend_deterministic = (
+            deterministic if backend_deterministic is None else backend_deterministic
+        )
         self.deterministic = deterministic
-        self._projection_version = 0
         self.random_features = DataAwareRandomFeatures(
             head_dim=head_dim,
             num_heads=num_heads,
@@ -253,10 +264,17 @@ class DarkformerKernelAttention(nn.Module):
             orthogonal=orthogonal_features,
             eps=eps,
             projection_seed=projection_seed,
-            deterministic=deterministic,
+            deterministic=self.fixed_projection,
         )
+        self._calls_since_redraw_value = 0
+        self._projection_version_value = 0
         self.register_buffer(
             "_calls_since_redraw",
+            torch.zeros((), dtype=torch.long),
+            persistent=True,
+        )
+        self.register_buffer(
+            "_projection_version",
             torch.zeros((), dtype=torch.long),
             persistent=True,
         )
@@ -271,6 +289,48 @@ class DarkformerKernelAttention(nn.Module):
             else torch.tensor(projection_seed % (2**63 - 1), dtype=torch.long)
         )
         self.register_buffer("_redraw_seed", redraw_seed, persistent=True)
+        self.register_load_state_dict_pre_hook(  # type: ignore[no-untyped-call]
+            self._restore_missing_projection_version
+        )
+        self.register_load_state_dict_post_hook(  # type: ignore[no-untyped-call]
+            self._sync_runtime_state
+        )
+
+    def _restore_missing_projection_version(
+        self,
+        module: nn.Module,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: object,
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_messages: list[str],
+    ) -> None:
+        del (
+            module,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_messages,
+        )
+        key = f"{prefix}_projection_version"
+        if key not in state_dict:
+            state_dict[key] = torch.zeros_like(self._projection_version)
+
+    def _sync_runtime_state(
+        self,
+        module: nn.Module,
+        incompatible_keys: object,
+    ) -> None:
+        del module, incompatible_keys
+        self._calls_since_redraw_value = int(self._calls_since_redraw.item())
+        self._projection_version_value = int(self._projection_version.item())
+
+    def _increment_projection_version(self) -> None:
+        self._projection_version.add_(1)
+        self._projection_version_value += 1
 
     @property
     def geometry(self) -> nn.Parameter:
@@ -301,7 +361,7 @@ class DarkformerKernelAttention(nn.Module):
             regularization=regularization,
             shrinkage=shrinkage,
         )
-        self._projection_version += 1
+        self._increment_projection_version()
         return self
 
     def _redraw_generator(self) -> torch.Generator:
@@ -326,7 +386,8 @@ class DarkformerKernelAttention(nn.Module):
         if not was_fixed or force:
             self._redraw_count.add_(1)
             self._calls_since_redraw.zero_()
-            self._projection_version += 1
+            self._calls_since_redraw_value = 0
+            self._increment_projection_version()
         return self
 
     @torch.no_grad()
@@ -349,7 +410,8 @@ class DarkformerKernelAttention(nn.Module):
         ):
             return
         self._calls_since_redraw.add_(1)
-        if int(self._calls_since_redraw.item()) >= self.feature_redraw_interval:
+        self._calls_since_redraw_value += 1
+        if self._calls_since_redraw_value >= self.feature_redraw_interval:
             self.redraw_projection_matrices_()
 
     def _use_exact_attention(self, query_length: int, key_length: int) -> bool:
@@ -357,6 +419,7 @@ class DarkformerKernelAttention(nn.Module):
             return True
         if self.attention_mode == "linear":
             return False
+        assert self.exact_threshold is not None
         return max(query_length, key_length) <= self.exact_threshold
 
     def _transformed_query_key(
@@ -513,7 +576,7 @@ class DarkformerKernelAttention(nn.Module):
                     raise ValueError(f"{name} must have dtype {query_features.dtype}")
             if state.sequence_length < 0:
                 raise ValueError("state.sequence_length must be nonnegative")
-            if state.projection_version != self._projection_version:
+            if state.projection_version != self._projection_version_value:
                 raise RuntimeError(
                     "attention geometry or projection matrices changed after the "
                     "state was created"
@@ -617,7 +680,7 @@ class DarkformerKernelAttention(nn.Module):
             key_value_sum=key_value_state,
             key_log_scale=key_log_scale,
             sequence_length=sequence_length + query.shape[2],
-            projection_version=self._projection_version,
+            projection_version=self._projection_version_value,
         )
         return output.to(value_dtype), next_state
 
@@ -671,7 +734,7 @@ class DarkformerKernelAttention(nn.Module):
             key_sum=key_features.sum(dim=-2),
             key_value_sum=torch.matmul(key_features.transpose(-1, -2), value),
             context_length=key.shape[2],
-            projection_version=self._projection_version,
+            projection_version=self._projection_version_value,
         )
 
     def forward_with_context_state(
@@ -703,7 +766,7 @@ class DarkformerKernelAttention(nn.Module):
         )
         if state.context_length < 1:
             raise ValueError("state.context_length must be positive")
-        if state.projection_version != self._projection_version:
+        if state.projection_version != self._projection_version_value:
             raise RuntimeError(
                 "attention geometry or projection matrices changed after the "
                 "state was created"
@@ -750,6 +813,8 @@ class DarkformerKernelAttention(nn.Module):
     ) -> torch.Tensor:
         """Apply data-aware normalized attention."""
         self._validate_inputs(query, key, value, query_mask, key_mask)
+        if self.attention_mode != "exact":
+            self._maybe_redraw()
         if self._use_exact_attention(query.shape[2], key.shape[2]):
             transformed_query, transformed_key = self._transformed_query_key(
                 query,
@@ -765,11 +830,10 @@ class DarkformerKernelAttention(nn.Module):
                 dropout_p=0.0,
                 backend=self.exact_backend,
                 scale=1.0,
-                deterministic=self.deterministic,
+                deterministic=self.backend_deterministic,
             )
             return output
 
-        self._maybe_redraw()
         if self.causal:
             output, _ = self._causal_attention_with_state(
                 query,
@@ -825,6 +889,8 @@ class SelfAttention(nn.Module):
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
         deterministic: bool = False,
+        fixed_projection: bool | None = None,
+        backend_deterministic: bool | None = None,
     ) -> None:
         super().__init__()
         if dim < 1 or heads < 1:
@@ -857,6 +923,8 @@ class SelfAttention(nn.Module):
             eps=eps,
             feature_redraw_interval=feature_redraw_interval,
             projection_seed=projection_seed,
+            fixed_projection=fixed_projection,
+            backend_deterministic=backend_deterministic,
             deterministic=deterministic,
         )
         self.to_output = nn.Linear(self.inner_dim, dim, bias=output_bias)
@@ -1004,6 +1072,8 @@ class CrossAttention(nn.Module):
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
         deterministic: bool = False,
+        fixed_projection: bool | None = None,
+        backend_deterministic: bool | None = None,
     ) -> None:
         super().__init__()
         context_dim = dim if context_dim is None else context_dim
@@ -1042,6 +1112,8 @@ class CrossAttention(nn.Module):
             eps=eps,
             feature_redraw_interval=feature_redraw_interval,
             projection_seed=projection_seed,
+            fixed_projection=fixed_projection,
+            backend_deterministic=backend_deterministic,
             deterministic=deterministic,
         )
         self.to_output = nn.Linear(self.inner_dim, dim, bias=output_bias)

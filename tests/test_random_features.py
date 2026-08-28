@@ -50,7 +50,8 @@ def test_whitening_initialization_matches_empirical_inverse_covariance() -> None
         num_features=16,
     )
 
-    random_features.initialize_whitening_(samples, regularization=0.0)
+    with pytest.warns(UserWarning, match="head_dim=3"):
+        random_features.initialize_whitening_(samples, regularization=0.0)
     transformed = samples @ random_features.geometry.transpose(-1, -2)
     centered = transformed - transformed.mean(dim=(0, 2), keepdim=True)
     covariance = torch.einsum("bhld,bhle->hde", centered, centered)
@@ -60,6 +61,9 @@ def test_whitening_initialization_matches_empirical_inverse_covariance() -> None
     torch.testing.assert_close(covariance, expected, rtol=2e-4, atol=2e-4)
 
 
+@pytest.mark.filterwarnings(
+    "ignore:literal whitening targets unit transformed covariance"
+)
 def test_whitening_initialization_respects_masks() -> None:
     """Masked samples do not contribute to covariance calibration."""
     generator = torch.Generator().manual_seed(7)
@@ -75,6 +79,9 @@ def test_whitening_initialization_respects_masks() -> None:
     torch.testing.assert_close(masked.geometry, sliced.geometry)
 
 
+@pytest.mark.filterwarnings(
+    "ignore:literal whitening targets unit transformed covariance"
+)
 def test_shared_whitening_pools_head_means() -> None:
     """Shared geometry uses covariance across every head sample."""
     samples = torch.tensor(
@@ -306,6 +313,16 @@ def test_fixed_projection_requires_force_or_unfix_to_redraw() -> None:
         random_features.projection_matrix,
         forced_projection,
     )
+
+
+def test_projection_fixed_cache_is_restored_from_state_dict() -> None:
+    """Checkpoint loading synchronizes the no-host-sync lifecycle cache."""
+    fixed = DataAwareRandomFeatures(4, 1, 8, deterministic=True)
+    restored = DataAwareRandomFeatures(4, 1, 8, deterministic=False)
+
+    restored.load_state_dict(fixed.state_dict())
+
+    assert restored.projection_is_fixed
 
 
 def test_geometry_receives_finite_nonzero_gradients() -> None:

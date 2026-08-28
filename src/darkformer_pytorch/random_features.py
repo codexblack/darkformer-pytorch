@@ -75,6 +75,7 @@ class DataAwareRandomFeatures(nn.Module):
     geometry: nn.Parameter
     projection_matrix: torch.Tensor
     _projection_fixed: torch.Tensor
+    _projection_fixed_value: bool
 
     def __init__(
         self,
@@ -138,16 +139,28 @@ class DataAwareRandomFeatures(nn.Module):
             generator=generator,
         )
         self.register_buffer("projection_matrix", projection, persistent=True)
+        self._projection_fixed_value = bool(deterministic)
         self.register_buffer(
             "_projection_fixed",
-            torch.tensor(bool(deterministic), dtype=torch.bool),
+            torch.tensor(self._projection_fixed_value, dtype=torch.bool),
             persistent=True,
         )
+        self.register_load_state_dict_post_hook(  # type: ignore[no-untyped-call]
+            self._sync_projection_fixed
+        )
+
+    def _sync_projection_fixed(
+        self,
+        module: nn.Module,
+        incompatible_keys: object,
+    ) -> None:
+        del module, incompatible_keys
+        self._projection_fixed_value = bool(self._projection_fixed.item())
 
     @property
     def projection_is_fixed(self) -> bool:
         """Whether ordinary redraw requests are disabled."""
-        return bool(self._projection_fixed.item())
+        return self._projection_fixed_value
 
     @torch.no_grad()
     def redraw_projection_(
@@ -182,12 +195,14 @@ class DataAwareRandomFeatures(nn.Module):
     def fix_projection_matrix_(self) -> DataAwareRandomFeatures:
         """Prevent ordinary projection redraws."""
         self._projection_fixed.fill_(True)
+        self._projection_fixed_value = True
         return self
 
     @torch.no_grad()
     def unfix_projection_matrix_(self) -> DataAwareRandomFeatures:
         """Allow projection redraws."""
         self._projection_fixed.fill_(False)
+        self._projection_fixed_value = False
         return self
 
     def covariance(self) -> torch.Tensor:
@@ -289,6 +304,10 @@ class DataAwareRandomFeatures(nn.Module):
         Returns:
           This module.
 
+        Warning:
+          Literal whitening targets unit covariance and can make exponential
+          random-feature variance impractical at ordinary head dimensions.
+
         Raises:
           ValueError: Inputs are invalid or the geometry is rank deficient.
         """
@@ -298,7 +317,6 @@ class DataAwareRandomFeatures(nn.Module):
             raise ValueError("regularization must be finite and nonnegative")
         if not 0.0 <= shrinkage <= 1.0 or not math.isfinite(shrinkage):
             raise ValueError("shrinkage must be finite and in [0, 1]")
-
         self._validate_calibration_mask("query_mask", query_mask, query)
         query_covariance, query_degrees = self._empirical_covariance(
             query,
@@ -346,6 +364,14 @@ class DataAwareRandomFeatures(nn.Module):
             eigenvectors
             @ torch.diag_embed(eigenvalues.rsqrt())
             @ eigenvectors.transpose(-1, -2)
+        )
+        warnings.warn(
+            "literal whitening targets unit transformed covariance, so the "
+            f"expected squared feature input norm is approximately head_dim="
+            f"{self.head_dim}; positive random-feature variance can grow "
+            "exponentially with this dimension",
+            UserWarning,
+            stacklevel=3,
         )
         self.geometry.copy_(inverse_root.to(self.geometry))
         return self
@@ -446,6 +472,8 @@ class DataAwareRandomFeatures(nn.Module):
                 )
                 maximum = valid_logits.amax(dim=(-2, -1), keepdim=True).detach()
                 maximum = torch.where(torch.isfinite(maximum), maximum, 0.0)
+            # A negative shift would make eps * exp(-maximum) overflow. With
+            # eps=0, underflowed attention rows are handled by normalization.
             maximum = maximum.clamp_min(0.0)
             features = torch.exp(logits - maximum)
             features = features + self.eps * torch.exp(-maximum)

@@ -53,11 +53,18 @@ def _sample_next_token(
     temperature: float,
     top_k: int | None,
 ) -> torch.Tensor:
+    """Sample one token per batch from ``(batch, vocab_size)`` logits."""
+    if logits.ndim != 2:
+        raise ValueError("logits must have shape (batch, vocab_size)")
     logits = logits / temperature
     if top_k is not None:
         count = min(top_k, logits.shape[-1])
-        threshold = logits.topk(count, dim=-1).values[:, -1, None]
-        logits = logits.masked_fill(logits < threshold, -torch.inf)
+        top_logits, top_indices = logits.topk(count, dim=-1)
+        logits = torch.full_like(logits, -torch.inf).scatter(
+            -1,
+            top_indices,
+            top_logits,
+        )
     return torch.multinomial(logits.softmax(dim=-1), 1)
 
 
@@ -115,6 +122,8 @@ class DarkformerBlock(nn.Module):
         feature_redraw_interval: int | None,
         projection_seed: int | None,
         deterministic: bool,
+        fixed_projection: bool | None = None,
+        backend_deterministic: bool | None = None,
         per_head_geometry: bool = True,
         orthogonal_features: bool = False,
         eps: float = 0.0,
@@ -139,6 +148,8 @@ class DarkformerBlock(nn.Module):
             causal_chunk_size=causal_chunk_size,
             feature_redraw_interval=feature_redraw_interval,
             projection_seed=projection_seed,
+            fixed_projection=fixed_projection,
+            backend_deterministic=backend_deterministic,
             deterministic=deterministic,
             eps=eps,
         )
@@ -161,6 +172,8 @@ class DarkformerBlock(nn.Module):
                 projection_seed=(
                     None if projection_seed is None else projection_seed + 1
                 ),
+                fixed_projection=fixed_projection,
+                backend_deterministic=backend_deterministic,
                 deterministic=deterministic,
                 eps=eps,
             )
@@ -303,6 +316,8 @@ class Darkformer(nn.Module):
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
         deterministic: bool = False,
+        fixed_projection: bool | None = None,
+        backend_deterministic: bool | None = None,
         eps: float = 0.0,
     ) -> None:
         super().__init__()
@@ -340,6 +355,8 @@ class Darkformer(nn.Module):
                     causal_chunk_size=causal_chunk_size,
                     feature_redraw_interval=feature_redraw_interval,
                     projection_seed=layer_seed,
+                    fixed_projection=fixed_projection,
+                    backend_deterministic=backend_deterministic,
                     deterministic=deterministic,
                     per_head_geometry=per_head_geometry,
                     orthogonal_features=orthogonal_features,
@@ -510,6 +527,8 @@ class DarkformerLM(nn.Module):
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
         deterministic: bool = False,
+        fixed_projection: bool | None = None,
+        backend_deterministic: bool | None = None,
         eps: float = 0.0,
     ) -> None:
         super().__init__()
@@ -543,6 +562,8 @@ class DarkformerLM(nn.Module):
             causal_chunk_size=causal_chunk_size,
             feature_redraw_interval=feature_redraw_interval,
             projection_seed=projection_seed,
+            fixed_projection=fixed_projection,
+            backend_deterministic=backend_deterministic,
             deterministic=deterministic,
             eps=eps,
         )
@@ -776,6 +797,8 @@ class DarkformerEncDec(nn.Module):
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
         deterministic: bool = False,
+        fixed_projection: bool | None = None,
+        backend_deterministic: bool | None = None,
         eps: float = 0.0,
     ) -> None:
         super().__init__()
@@ -824,6 +847,8 @@ class DarkformerEncDec(nn.Module):
             causal_chunk_size=causal_chunk_size,
             feature_redraw_interval=feature_redraw_interval,
             projection_seed=projection_seed,
+            fixed_projection=fixed_projection,
+            backend_deterministic=backend_deterministic,
             deterministic=deterministic,
             eps=eps,
         )
@@ -851,6 +876,8 @@ class DarkformerEncDec(nn.Module):
             causal_chunk_size=causal_chunk_size,
             feature_redraw_interval=feature_redraw_interval,
             projection_seed=decoder_seed,
+            fixed_projection=fixed_projection,
+            backend_deterministic=backend_deterministic,
             deterministic=deterministic,
             eps=eps,
         )

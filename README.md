@@ -124,14 +124,22 @@ mask with the causal constraint.
 
 Independent Gaussian features are the default, matching Equation (3). Set
 `orthogonal_features=True` to use Performer-style orthogonal Gaussian blocks.
-The additive feature floor is disabled by default; set `eps` to a small positive
-value in linear mode when underflow protection is more important than the exact
-estimator. Exact and automatic modes require `eps=0` so both paths evaluate the
-same learned kernel.
+The additive feature floor is disabled by default. Linear attention treats a
+normalization mass at or below `torch.finfo(dtype).tiny` as an underflowed row and
+returns a zero output with zero gradients, preventing a finite forward pass from
+creating NaNs in division backward. Set `eps` to a small positive value in linear
+mode only when avoiding these zero fallback rows is more important than retaining
+the paper's estimator. Exact and automatic modes reject `eps > 0` because the
+floor would introduce an additional mismatch between their exact and finite-feature
+paths.
 
 The stabilized public feature maps rescale features by factors that cancel during
 normalized attention. For direct kernel estimation with feature inner products,
 use `stabilize=False` and `eps=0` to retain the unbiased Equation (3) estimator.
+The stabilizing shift is not allowed below zero because the correction term
+`eps * exp(-shift)` could otherwise overflow when `eps > 0`; the normalization
+fallback above protects the default `eps=0` attention path if all features still
+underflow.
 
 ### Data-aware initialization
 
@@ -166,6 +174,22 @@ so the calibrated score is $q_0^\mathsf{T}\Lambda_0^{-1}k_0$ rather than
 $q_0^\mathsf{T}\Lambda_0^{-1}k_0/\sqrt{d_h}$. Leave the identity initialization
 in place when a temperature-preserving start is more important than literal
 Proposition C.1 whitening.
+
+Literal whitening can also put the finite positive-random-feature estimator in a
+very high-variance regime. It targets unit covariance for each transformed
+coordinate, so
+
+```math
+\mathbb{E}\lVert Mq\rVert^2 \approx d_h.
+```
+
+The variance of exponential random features grows exponentially with this norm;
+the effect is already severe for ordinary head dimensions. Unit covariance also
+sits outside the $\lambda_i < 1/2$ integrability condition used by the paper's
+optimality result. `initialize_whitening_` therefore emits a warning containing
+the configured `head_dim`. Leave the identity initialization in place unless
+literal Proposition C.1 whitening is specifically intended, and validate any
+calibrated geometry with the feature count and data distribution used in training.
 
 ```python
 import torch
@@ -221,9 +245,15 @@ the paper's derivation treats one query-key distribution.
 | --- | --- |
 | `"linear"` | Uses positive random features and associative linear attention. |
 | `"exact"` | Evaluates the learned kernel with exact softmax attention. |
-| `"auto"` | Uses exact attention through `exact_threshold`, then linear attention. |
+| `"auto"` | Uses exact attention through `exact_threshold`, then switches to the finite-feature approximation. |
 
-For automatic selection, provide the cutoff explicitly:
+Exact and linear modes compute materially different functions at finite feature
+counts. Consequently, `"auto"` is an explicit accuracy/performance policy, not a
+backend-only optimization: output can change discontinuously when a sequence
+crosses the cutoff. `exact_threshold` is required with `attention_mode="auto"` and
+is independent of `num_features`.
+
+Provide the cutoff explicitly:
 
 ```python
 attention = DarkformerAttention(
@@ -287,8 +317,11 @@ output = cross_attention(
 
 Random projections stay unchanged unless a redraw is requested. The default
 `feature_redraw_interval=None` disables scheduled redraws. A positive interval
-redraws after that many training forwards. Evaluation forwards do not advance the
-schedule.
+redraws after that many training forwards that belong to a linear-capable module.
+In `"auto"` mode, short forwards routed through exact attention still advance the
+schedule, so the interval counts training steps rather than only linear-path
+executions. Exact-only modules do not redraw unused random features. Evaluation
+forwards do not advance the schedule.
 
 All public attention and model modules expose the same in-place lifecycle methods:
 
@@ -301,10 +334,13 @@ attention.unfix_projection_matrices_()
 
 Fixed projections ignore ordinary manual and scheduled redraws. Pass `force=True`
 for an intentional one-time redraw while fixed. `projection_seed` makes initial
-projections reproducible independently of PyTorch's global random state.
-`deterministic=True` fixes projection matrices at construction. It also passes the
-backend deterministic flag to FlashAttention 2 and 3, while the SDPA fallback uses
-its math backend. Configure PyTorch's global deterministic settings separately when
+projections reproducible independently of PyTorch's global random state. Use
+`fixed_projection=True` to fix projection matrices at construction, and use
+`backend_deterministic=True` to request deterministic exact-backend behavior from
+FlashAttention 2 or 3 and the SDPA math fallback. These controls are independent.
+The historical `deterministic` argument remains as a compatibility shorthand that
+sets both policies; either explicit policy argument overrides its corresponding
+legacy value. Configure PyTorch's global deterministic settings separately when
 end-to-end determinism is required.
 
 For a scheduled training policy:
@@ -466,6 +502,10 @@ generated = model.generate(
 )
 ```
 
+`top_k` keeps exactly that many candidates per batch item. If logits tie at the
+cutoff, PyTorch's `topk` ordering chooses which tied entries remain; ties do not
+increase the candidate count.
+
 With `attention_mode="linear"`, generation processes the prompt once and then
 updates recurrent self-attention statistics for each appended token. Decoder
 cross-attention projects and summarizes the encoded source once per layer.
@@ -478,6 +518,8 @@ and through `decode_with_state(...)` on `DarkformerEncDec`. Cached states are
 append-only and tied to the model parameters, device, dtype, masks, and random
 projection matrices used to create them. Discard a state after changing any of
 those inputs. A projection redraw is detected and rejected automatically.
+The projection version and redraw counter are checkpointed, so stale cached states
+remain rejectable after saving and reloading a model.
 
 ## Benchmark
 

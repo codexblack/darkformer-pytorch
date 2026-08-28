@@ -8,16 +8,27 @@ import torch
 from torch import nn
 
 from darkformer_pytorch.attention import AttentionMode
-from darkformer_pytorch.model import DarkformerBlock, DarkformerEncDec, DarkformerLM
+from darkformer_pytorch.model import (
+    DarkformerBlock,
+    DarkformerEncDec,
+    DarkformerLM,
+    _sample_next_token,
+)
 from darkformer_pytorch.random_features import DataAwareRandomFeatures
 
 ProjectionModel = DarkformerLM | DarkformerEncDec
+
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:literal whitening targets unit transformed covariance"
+)
 
 
 def _language_model(
     *,
     depth: int = 1,
     deterministic: bool = True,
+    fixed_projection: bool | None = None,
+    backend_deterministic: bool | None = None,
     causal: bool = True,
     attention_mode: AttentionMode = "linear",
     rotary: bool = False,
@@ -38,6 +49,8 @@ def _language_model(
         rotary=rotary,
         causal_chunk_size=2,
         projection_seed=7,
+        fixed_projection=fixed_projection,
+        backend_deterministic=backend_deterministic,
         deterministic=deterministic,
     )
 
@@ -119,6 +132,25 @@ def _assert_projection_controls(
         not torch.equal(before, after)
         for before, after in zip(forced, redrawn, strict=True)
     )
+
+
+def test_sample_next_token_top_k_keeps_exactly_k_tied_candidates() -> None:
+    logits = torch.tensor(
+        [[2.0, 2.0, 2.0, 0.0], [1.0, 1.0, 1.0, 1.0]],
+    )
+
+    with mock.patch("torch.multinomial", wraps=torch.multinomial) as multinomial:
+        sampled = _sample_next_token(logits, temperature=1.0, top_k=2)
+
+    probabilities = cast(torch.Tensor, multinomial.call_args.args[0])
+    assert sampled.shape == (2, 1)
+    assert torch.count_nonzero(probabilities, dim=-1).tolist() == [2, 2]
+
+
+@pytest.mark.parametrize("shape", [(4,), (2, 1, 4)])
+def test_sample_next_token_rejects_non_matrix_logits(shape: tuple[int, ...]) -> None:
+    with pytest.raises(ValueError, match=r"shape \(batch, vocab_size\)"):
+        _sample_next_token(torch.zeros(shape), temperature=1.0, top_k=None)
 
 
 @torch.no_grad()
@@ -462,6 +494,20 @@ def test_model_defaults_use_paper_feature_estimator() -> None:
     for random_features in _random_feature_modules(model):
         assert not random_features.orthogonal
         assert random_features.eps == 0.0
+
+
+def test_model_propagates_independent_determinism_policies() -> None:
+    """High-level constructors preserve separate projection/backend settings."""
+    model = _language_model(
+        depth=2,
+        deterministic=False,
+        fixed_projection=True,
+        backend_deterministic=False,
+    )
+
+    for attention in model.transformer._attention_modules():
+        assert attention.attention.random_features.projection_is_fixed
+        assert not attention.attention.backend_deterministic
 
 
 def test_language_model_whitening_calibrates_all_layers() -> None:

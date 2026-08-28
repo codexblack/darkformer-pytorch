@@ -11,6 +11,10 @@ from darkformer_pytorch.attention import (
     SelfAttention,
 )
 
+pytestmark = pytest.mark.filterwarnings(
+    "ignore:literal whitening targets unit transformed covariance"
+)
+
 
 def _feature_attention_reference(
     query_features: torch.Tensor,
@@ -37,6 +41,28 @@ def _feature_attention_reference(
     if query_mask is not None:
         output = output.masked_fill(~query_mask[:, None, :, None], 0.0)
     return output
+
+
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+def test_attention_normalization_masks_subnormal_denominators(
+    dtype: torch.dtype,
+) -> None:
+    """Subnormal denominators produce masked outputs and finite gradients."""
+    tiny = torch.finfo(dtype).tiny
+    denominator = torch.tensor([tiny / 2], dtype=dtype, requires_grad=True)
+    numerator = torch.tensor([[tiny]], dtype=dtype, requires_grad=True)
+
+    output: torch.Tensor = attention_module._normalize_attention(
+        numerator,
+        denominator,
+    )
+    torch.autograd.backward(output, torch.zeros_like(output))
+
+    assert numerator.grad is not None
+    assert denominator.grad is not None
+    torch.testing.assert_close(output, torch.zeros_like(output))
+    torch.testing.assert_close(numerator.grad, torch.zeros_like(numerator))
+    torch.testing.assert_close(denominator.grad, torch.zeros_like(denominator))
 
 
 def test_noncausal_linear_attention_matches_feature_reference() -> None:
@@ -267,6 +293,101 @@ def test_auto_mode_routes_around_threshold(
     assert long_output.shape == (1, 1, 4, 2)
 
 
+def test_auto_mode_requires_explicit_threshold() -> None:
+    """Auto routing cannot silently couple its cutoff to feature count."""
+    with pytest.raises(ValueError, match="exact_threshold is required"):
+        DarkformerKernelAttention(
+            head_dim=4,
+            num_heads=1,
+            attention_mode="auto",
+        )
+
+
+def test_auto_exact_forwards_advance_redraw_schedule() -> None:
+    """Short auto-mode forwards count even while they use exact attention."""
+    attention = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        num_features=8,
+        attention_mode="auto",
+        exact_threshold=4,
+        exact_backend="sdpa",
+        feature_redraw_interval=2,
+        projection_seed=5,
+    )
+    tensor = torch.randn(1, 1, 3, 4)
+    projection = attention.random_features.projection_matrix.clone()
+
+    attention(tensor, tensor, tensor)
+
+    assert attention._calls_since_redraw_value == 1
+    torch.testing.assert_close(
+        attention.random_features.projection_matrix,
+        projection,
+        rtol=0,
+        atol=0,
+    )
+
+    attention(tensor, tensor, tensor)
+
+    assert attention._calls_since_redraw_value == 0
+    assert attention._redraw_count.item() == 1
+    assert not torch.equal(
+        attention.random_features.projection_matrix,
+        projection,
+    )
+
+
+@pytest.mark.parametrize(
+    ("fixed_projection", "backend_deterministic"),
+    [(True, False), (False, True)],
+)
+def test_projection_and_backend_determinism_are_independent(
+    monkeypatch: pytest.MonkeyPatch,
+    fixed_projection: bool,
+    backend_deterministic: bool,
+) -> None:
+    """Projection lifecycle and exact-backend policy have separate flags."""
+    received: list[bool] = []
+
+    def fake_exact_attention(
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        del key
+        received.append(bool(kwargs["deterministic"]))
+        return value.new_zeros(*query.shape[:-1], value.shape[-1])
+
+    monkeypatch.setattr(attention_module, "exact_attention", fake_exact_attention)
+    attention = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        attention_mode="exact",
+        fixed_projection=fixed_projection,
+        backend_deterministic=backend_deterministic,
+    )
+    tensor = torch.randn(1, 1, 3, 4)
+
+    attention(tensor, tensor, tensor)
+
+    assert attention.random_features.projection_is_fixed is fixed_projection
+    assert received == [backend_deterministic]
+
+
+def test_legacy_deterministic_flag_sets_both_policies() -> None:
+    """The historical combined flag remains a compatibility shorthand."""
+    attention = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        deterministic=True,
+    )
+
+    assert attention.random_features.projection_is_fixed
+    assert attention.backend_deterministic
+
+
 @pytest.mark.parametrize("attention_mode", ["auto", "exact"])
 def test_positive_eps_requires_linear_mode(
     attention_mode: attention_module.AttentionMode,
@@ -329,6 +450,45 @@ def test_unseeded_redraw_is_reproducible_from_checkpoint_state() -> None:
         second.random_features.projection_matrix,
         rtol=0,
         atol=0,
+    )
+
+
+def test_redraw_schedule_resumes_from_checkpoint_counter() -> None:
+    """Loading a checkpoint restores the host-side redraw counter cache."""
+    first = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        num_features=8,
+        attention_mode="auto",
+        exact_threshold=4,
+        exact_backend="sdpa",
+        feature_redraw_interval=3,
+        projection_seed=7,
+    )
+    tensor = torch.randn(1, 1, 3, 4)
+    first(tensor, tensor, tensor)
+
+    restored = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        num_features=8,
+        attention_mode="auto",
+        exact_threshold=4,
+        exact_backend="sdpa",
+        feature_redraw_interval=3,
+        projection_seed=7,
+    )
+    restored.load_state_dict(first.state_dict())
+    projection = restored.random_features.projection_matrix.clone()
+
+    restored(tensor, tensor, tensor)
+    assert restored._calls_since_redraw_value == 2
+    restored(tensor, tensor, tensor)
+
+    assert restored._redraw_count.item() == 1
+    assert not torch.equal(
+        restored.random_features.projection_matrix,
+        projection,
     )
 
 
@@ -547,6 +707,53 @@ def test_causal_state_rejects_projection_redraw() -> None:
             tensor[:, :, :1],
             state=state,
         )
+
+
+def test_checkpoint_preserves_projection_version_for_state_validation() -> None:
+    """A stale recurrent state remains stale across a checkpoint reload."""
+    attention = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        num_features=8,
+        causal=True,
+        fixed_projection=True,
+        projection_seed=13,
+    )
+    tensor = torch.randn(1, 1, 2, 4)
+    _, stale_state = attention.forward_with_state(tensor, tensor, tensor)
+    attention.redraw_projection_matrices_(force=True)
+
+    restored = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        num_features=8,
+        causal=True,
+        fixed_projection=True,
+        projection_seed=13,
+    )
+    restored.load_state_dict(attention.state_dict())
+
+    assert "_projection_version" in restored.state_dict()
+    assert restored._projection_version_value == 1
+    with pytest.raises(RuntimeError, match="projection matrices changed"):
+        restored.forward_with_state(
+            tensor[:, :, :1],
+            tensor[:, :, :1],
+            tensor[:, :, :1],
+            state=stale_state,
+        )
+
+
+def test_checkpoint_without_projection_version_loads_as_version_zero() -> None:
+    """Checkpoints created before version persistence remain loadable."""
+    attention = DarkformerKernelAttention(head_dim=4, num_heads=1)
+    state_dict = attention.state_dict()
+    del state_dict["_projection_version"]
+
+    restored = DarkformerKernelAttention(head_dim=4, num_heads=1)
+    restored.load_state_dict(state_dict)
+
+    assert restored._projection_version_value == 0
 
 
 def test_causal_state_rejects_whitening_change() -> None:
