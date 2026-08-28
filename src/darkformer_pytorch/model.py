@@ -215,6 +215,7 @@ class DarkformerBlock(nn.Module):
         context_mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
+        geometry_scale: float = 1.0,
     ) -> torch.Tensor:
         """Calibrate this block and return inputs for the next block."""
         normalized = self.self_norm(inputs)
@@ -223,6 +224,7 @@ class DarkformerBlock(nn.Module):
             mask=mask,
             regularization=regularization,
             shrinkage=shrinkage,
+            geometry_scale=geometry_scale,
         )
         inputs = inputs + self.self_attention(normalized, mask=mask)
         if self.cross_attention is not None:
@@ -236,6 +238,7 @@ class DarkformerBlock(nn.Module):
                 context_mask=context_mask,
                 regularization=regularization,
                 shrinkage=shrinkage,
+                geometry_scale=geometry_scale,
             )
             inputs = inputs + self.cross_attention(
                 normalized,
@@ -409,6 +412,7 @@ class Darkformer(nn.Module):
         context_mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
+        geometry_scale: float = 1.0,
     ) -> Darkformer:
         """Calibrate every attention geometry on representative activations."""
         was_training = self.training
@@ -423,6 +427,7 @@ class Darkformer(nn.Module):
                     context_mask=context_mask,
                     regularization=regularization,
                     shrinkage=shrinkage,
+                    geometry_scale=geometry_scale,
                 )
         finally:
             self.train(was_training)
@@ -610,6 +615,7 @@ class DarkformerLM(nn.Module):
         mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
+        geometry_scale: float = 1.0,
     ) -> DarkformerLM:
         """Calibrate all attention geometries on representative tokens."""
         self._validate_tokens(tokens, "tokens")
@@ -618,6 +624,7 @@ class DarkformerLM(nn.Module):
             mask=mask,
             regularization=regularization,
             shrinkage=shrinkage,
+            geometry_scale=geometry_scale,
         )
         return self
 
@@ -927,6 +934,7 @@ class DarkformerEncDec(nn.Module):
         target_mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
+        geometry_scale: float = 1.0,
     ) -> DarkformerEncDec:
         """Calibrate encoder and decoder geometries on representative tokens."""
         was_training = self.training
@@ -948,6 +956,7 @@ class DarkformerEncDec(nn.Module):
                 mask=source_mask,
                 regularization=regularization,
                 shrinkage=shrinkage,
+                geometry_scale=geometry_scale,
             )
             context = self.encoder_norm(self.encoder(source, mask=source_mask))
             self.decoder.initialize_whitening_(
@@ -957,6 +966,7 @@ class DarkformerEncDec(nn.Module):
                 context_mask=source_mask,
                 regularization=regularization,
                 shrinkage=shrinkage,
+                geometry_scale=geometry_scale,
             )
         finally:
             self.train(was_training)

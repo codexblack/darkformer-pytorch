@@ -324,6 +324,7 @@ def _darkformer_attention(
     eps: float,
     regularization: float,
     shrinkage: float,
+    geometry_scale: float,
 ) -> DarkformerKernelAttention:
     attention = DarkformerKernelAttention(
         query.shape[-1],
@@ -350,6 +351,7 @@ def _darkformer_attention(
         calibration_key,
         regularization=regularization,
         shrinkage=shrinkage,
+        geometry_scale=geometry_scale,
     )
     return attention
 
@@ -371,6 +373,7 @@ def _method(
     performer_accumulation: PerformerAccumulation,
     regularization: float,
     shrinkage: float,
+    geometry_scale: float,
 ) -> Method:
     if name in ("sdpa-math", "sdpa-flash"):
         if name == "sdpa-flash" and not _flash_attention_available(query.device):
@@ -421,6 +424,7 @@ def _method(
         eps=estimator_eps,
         regularization=regularization,
         shrinkage=shrinkage,
+        geometry_scale=geometry_scale,
     )
     return Method(
         name,
@@ -538,6 +542,7 @@ def _error_result(
     performer_accumulation: PerformerAccumulation,
     regularization: float,
     shrinkage: float,
+    geometry_scale: float,
 ) -> ErrorResult:
     errors: list[float] = []
     reference_name = _error_reference(method_name)
@@ -608,6 +613,7 @@ def _error_result(
                 eps=estimator_eps,
                 regularization=regularization,
                 shrinkage=shrinkage,
+                geometry_scale=geometry_scale,
             )
             with torch.inference_mode():
                 reference = exact(query, key, value)
@@ -633,6 +639,7 @@ def _error_result(
                     eps=estimator_eps,
                     regularization=regularization,
                     shrinkage=shrinkage,
+                    geometry_scale=geometry_scale,
                 )
                 with torch.inference_mode():
                     output = linear(query, key, value)
@@ -938,6 +945,7 @@ def _parser() -> argparse.ArgumentParser:
         default=1e-4,
     )
     parser.add_argument("--shrinkage", type=_nonnegative_float, default=0.01)
+    parser.add_argument("--geometry-scale", type=_positive_float, default=1.0)
     parser.add_argument(
         "--causal",
         action=argparse.BooleanOptionalAction,
@@ -1029,6 +1037,7 @@ def main() -> None:
                     performer_accumulation=performer_accumulation,
                     regularization=args.regularization,
                     shrinkage=args.shrinkage,
+                    geometry_scale=args.geometry_scale,
                 )
                 result = _measure(
                     selected,
@@ -1099,6 +1108,7 @@ def main() -> None:
             performer_accumulation=performer_accumulation,
             regularization=args.regularization,
             shrinkage=args.shrinkage,
+            geometry_scale=args.geometry_scale,
         )
         for method in methods
         if method != "sdpa-math"
@@ -1109,7 +1119,7 @@ def main() -> None:
     payload = {
         "metadata": metadata,
         "config": {
-            "protocol_version": 2,
+            "protocol_version": 3,
             "methods": list(methods),
             "sequence_lengths": list(lengths),
             "batch_size": args.batch_size,
@@ -1124,6 +1134,7 @@ def main() -> None:
             "calibration_length": args.calibration_length,
             "regularization": args.regularization,
             "shrinkage": args.shrinkage,
+            "geometry_scale": args.geometry_scale,
             "warmup": args.warmup,
             "min_run_time": args.min_run_time,
             "timing_repeats": args.timing_repeats,

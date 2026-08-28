@@ -61,6 +61,47 @@ def test_whitening_initialization_matches_empirical_inverse_covariance() -> None
     torch.testing.assert_close(covariance, expected, rtol=2e-4, atol=2e-4)
 
 
+def test_whitening_geometry_scale_controls_transformed_covariance() -> None:
+    """Post-whitening scaling sets covariance without changing its shape."""
+    generator = torch.Generator().manual_seed(6)
+    samples = torch.randn(8, 2, 128, 3, generator=generator)
+    mixing = torch.tensor(
+        [[2.0, 0.0, 0.0], [0.7, 0.5, 0.0], [-0.2, 0.4, 1.5]],
+    )
+    samples = samples @ mixing.transpose(0, 1)
+    random_features = DataAwareRandomFeatures(3, 2, 16)
+    geometry_scale = 0.5
+
+    with pytest.warns(
+        UserWarning,
+        match=r"geometry_scale=0\.5.*approximately 0\.75",
+    ):
+        random_features.initialize_whitening_(
+            samples,
+            regularization=0.0,
+            geometry_scale=geometry_scale,
+        )
+    transformed = samples @ random_features.geometry.transpose(-1, -2)
+    centered = transformed - transformed.mean(dim=(0, 2), keepdim=True)
+    covariance = torch.einsum("bhld,bhle->hde", centered, centered)
+    covariance = covariance / (samples.shape[0] * samples.shape[2] - 1)
+
+    expected = geometry_scale**2 * torch.eye(3).expand(2, -1, -1)
+    torch.testing.assert_close(covariance, expected, rtol=2e-4, atol=2e-4)
+
+
+@pytest.mark.parametrize("geometry_scale", [0.0, -0.5, math.nan, math.inf])
+def test_whitening_rejects_invalid_geometry_scale(geometry_scale: float) -> None:
+    """Scaling must preserve a finite, full-rank whitening geometry."""
+    random_features = DataAwareRandomFeatures(3, 1, 16)
+
+    with pytest.raises(ValueError, match="geometry_scale must be finite and positive"):
+        random_features.initialize_whitening_(
+            torch.randn(2, 1, 4, 3),
+            geometry_scale=geometry_scale,
+        )
+
+
 @pytest.mark.filterwarnings(
     "ignore:literal whitening targets unit transformed covariance"
 )
@@ -163,6 +204,30 @@ def test_forward_shapes_and_values_are_finite() -> None:
     assert torch.all(torch.isfinite(key_features))
     assert torch.all(query_features > 0)
     assert torch.all(key_features > 0)
+
+
+@pytest.mark.parametrize("eps", [0.0, 1e-4])
+def test_stabilization_keeps_all_negative_logits_representable(eps: float) -> None:
+    """Large negative logits neither underflow nor overflow after stabilization."""
+    random_features = DataAwareRandomFeatures(
+        head_dim=2,
+        num_heads=1,
+        num_features=4,
+        eps=eps,
+        deterministic=True,
+    )
+    with torch.no_grad():
+        random_features.geometry.copy_(30.0 * torch.eye(2).unsqueeze(0))
+        random_features.projection_matrix.zero_()
+    query = torch.ones(1, 1, 3, 2)
+    key = torch.ones(1, 1, 4, 2)
+
+    query_features, key_features = random_features(query, key)
+
+    assert torch.all(torch.isfinite(query_features))
+    assert torch.all(torch.isfinite(key_features))
+    assert torch.all(query_features > 0.0)
+    assert torch.all(key_features > 0.0)
 
 
 def test_key_mask_zeros_only_invalid_key_features() -> None:

@@ -517,7 +517,12 @@ def test_language_model_whitening_calibrates_all_layers() -> None:
     modules = _random_feature_modules(model)
     initial = [module.geometry.detach().clone() for module in modules]
 
-    model.initialize_whitening_(tokens, regularization=1e-3)
+    with pytest.warns(UserWarning, match="geometry_scale=0.5"):
+        model.initialize_whitening_(
+            tokens,
+            regularization=1e-3,
+            geometry_scale=0.5,
+        )
 
     assert model.training
     for module, original in zip(modules, initial, strict=True):
@@ -530,13 +535,27 @@ def test_encoder_decoder_whitening_uses_normalized_context() -> None:
     source_tokens = torch.randint(0, model.source_vocab_size, (4, 8))
     target_tokens = torch.randint(0, model.target_vocab_size, (4, 8))
 
-    with mock.patch.object(
-        model.decoder,
-        "initialize_whitening_",
-        wraps=model.decoder.initialize_whitening_,
-    ) as decoder_initializer:
-        model.initialize_whitening_(source_tokens, target_tokens)
+    with (
+        mock.patch.object(
+            model.encoder,
+            "initialize_whitening_",
+            wraps=model.encoder.initialize_whitening_,
+        ) as encoder_initializer,
+        mock.patch.object(
+            model.decoder,
+            "initialize_whitening_",
+            wraps=model.decoder.initialize_whitening_,
+        ) as decoder_initializer,
+        pytest.warns(UserWarning, match="geometry_scale=0.5"),
+    ):
+        model.initialize_whitening_(
+            source_tokens,
+            target_tokens,
+            geometry_scale=0.5,
+        )
 
+    assert encoder_initializer.call_args.kwargs["geometry_scale"] == 0.5
+    assert decoder_initializer.call_args.kwargs["geometry_scale"] == 0.5
     context = decoder_initializer.call_args.kwargs["context"]
     expected = model.encode(source_tokens)
     unnormalized = model.encoder(model.source_embedding(source_tokens))

@@ -350,6 +350,7 @@ class DarkformerKernelAttention(nn.Module):
         key_mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
+        geometry_scale: float = 1.0,
     ) -> DarkformerKernelAttention:
         """Whiten the scaled query and key inputs used by the attention kernel."""
         normalizer = self.head_dim**-0.25
@@ -360,6 +361,7 @@ class DarkformerKernelAttention(nn.Module):
             key_mask=key_mask,
             regularization=regularization,
             shrinkage=shrinkage,
+            geometry_scale=geometry_scale,
         )
         self._increment_projection_version()
         return self
@@ -529,15 +531,23 @@ class DarkformerKernelAttention(nn.Module):
     ) -> tuple[torch.Tensor, CausalAttentionState]:
         query_logits = self.random_features.feature_logits(query)
         key_logits = self.random_features.feature_logits(key)
-        query_maximum = query_logits.amax(dim=-1, keepdim=True).detach().clamp_min(0.0)
+        query_maximum = query_logits.amax(dim=-1, keepdim=True).detach()
+        if self.eps > 0.0:
+            query_maximum = query_maximum.clamp_min(0.0)
         feature_scale = self.num_features**-0.5
         query_features = torch.exp(query_logits - query_maximum)
-        query_features = query_features + self.eps * torch.exp(-query_maximum)
+        if self.eps > 0.0:
+            query_features = query_features + self.eps * torch.exp(-query_maximum)
         query_features = query_features * feature_scale
         value_dtype = value.dtype
         value = value.to(query_features.dtype)
         batch, heads, _, features = query_features.shape
         value_dim = value.shape[-1]
+        scale_floor = (
+            0.0
+            if self.eps > 0.0
+            else torch.finfo(query_features.dtype).min
+        )
         if state is None:
             key_state = query_features.new_zeros(batch, heads, features)
             key_value_state = query_features.new_zeros(
@@ -548,7 +558,7 @@ class DarkformerKernelAttention(nn.Module):
             )
             key_log_scale = query_features.new_full(
                 (batch, heads, 1, 1),
-                0.0,
+                scale_floor,
             )
             sequence_length = 0
         else:
@@ -603,8 +613,10 @@ class DarkformerKernelAttention(nn.Module):
             first_scale = torch.where(
                 torch.isfinite(token_scale[:, :, :1]),
                 token_scale[:, :, :1],
-                0.0,
-            ).clamp_min(0.0)
+                scale_floor,
+            )
+            if self.eps > 0.0:
+                first_scale = first_scale.clamp_min(0.0)
             calculation_scale = torch.maximum(key_log_scale, first_scale)
             excessive_rise = token_scale > calculation_scale + 16.0
             excessive_rise[:, :, 0] = False
@@ -617,17 +629,24 @@ class DarkformerKernelAttention(nn.Module):
             key_logits_chunk = key_logits[:, :, start:stop]
             value_chunk = value[:, :, start:stop]
             key_mask_chunk = None if key_mask is None else key_mask[:, start:stop]
-            previous_factor = torch.exp(key_log_scale - calculation_scale)
+            arithmetic_scale = torch.where(
+                torch.isfinite(calculation_scale),
+                calculation_scale,
+                0.0,
+            )
+            previous_factor = torch.exp(key_log_scale - arithmetic_scale)
             key_state = key_state * previous_factor.squeeze(-1)
             key_value_state = key_value_state * previous_factor
-            scaled_key_logits = key_logits_chunk - calculation_scale
+            scaled_key_logits = key_logits_chunk
             if key_mask_chunk is not None:
                 scaled_key_logits = scaled_key_logits.masked_fill(
                     ~key_mask_chunk[:, None, :, None],
                     -torch.inf,
                 )
+            scaled_key_logits = scaled_key_logits - arithmetic_scale
             key_chunk = torch.exp(scaled_key_logits)
-            key_chunk = key_chunk + self.eps * torch.exp(-calculation_scale)
+            if self.eps > 0.0:
+                key_chunk = key_chunk + self.eps * torch.exp(-arithmetic_scale)
             key_chunk = key_chunk * feature_scale
             if key_mask_chunk is not None:
                 key_chunk = key_chunk.masked_fill(
@@ -664,10 +683,17 @@ class DarkformerKernelAttention(nn.Module):
             chunk_scale = torch.where(
                 torch.isfinite(chunk_scale),
                 chunk_scale,
-                0.0,
-            ).clamp_min(0.0)
+                scale_floor,
+            )
+            if self.eps > 0.0:
+                chunk_scale = chunk_scale.clamp_min(0.0)
             next_scale = torch.maximum(calculation_scale, chunk_scale)
-            next_factor = torch.exp(calculation_scale - next_scale)
+            arithmetic_next_scale = torch.where(
+                torch.isfinite(next_scale),
+                next_scale,
+                0.0,
+            )
+            next_factor = torch.exp(arithmetic_scale - arithmetic_next_scale)
             key_state = key_state * next_factor.squeeze(-1)
             key_value_state = key_value_state * next_factor
             key_log_scale = next_scale
@@ -947,6 +973,7 @@ class SelfAttention(nn.Module):
         mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
+        geometry_scale: float = 1.0,
     ) -> SelfAttention:
         """Initialize geometry from projected queries and keys for sample inputs."""
         query, key, _ = self._project_inputs(inputs)
@@ -959,6 +986,7 @@ class SelfAttention(nn.Module):
             key_mask=mask,
             regularization=regularization,
             shrinkage=shrinkage,
+            geometry_scale=geometry_scale,
         )
         return self
 
@@ -1138,6 +1166,7 @@ class CrossAttention(nn.Module):
         context_mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
+        geometry_scale: float = 1.0,
     ) -> CrossAttention:
         """Initialize geometry from sample cross-attention queries and keys."""
         query = self._project_query(inputs)
@@ -1151,6 +1180,7 @@ class CrossAttention(nn.Module):
             key_mask=context_mask,
             regularization=regularization,
             shrinkage=shrinkage,
+            geometry_scale=geometry_scale,
         )
         return self
 

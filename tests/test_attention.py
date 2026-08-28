@@ -156,6 +156,85 @@ def test_causal_linear_attention_matches_prefix_reference() -> None:
     assert torch.count_nonzero(actual[:, :, 3:]) == 0
 
 
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("eps", [0.0, 1e-4])
+def test_large_geometry_does_not_collapse_linear_attention(
+    causal: bool,
+    eps: float,
+) -> None:
+    """All-negative feature logits retain outputs and value gradients."""
+    attention = DarkformerKernelAttention(
+        head_dim=2,
+        num_heads=1,
+        num_features=4,
+        causal=causal,
+        causal_chunk_size=4,
+        eps=eps,
+        deterministic=True,
+    )
+    with torch.no_grad():
+        attention.geometry.copy_(30.0 * torch.eye(2).unsqueeze(0))
+        attention.random_features.projection_matrix.zero_()
+    query = torch.ones(1, 1, 4, 2)
+    key = torch.ones(1, 1, 4, 2)
+    value = torch.tensor([[[[1.0], [3.0], [5.0], [7.0]]]], requires_grad=True)
+    assert torch.all(attention.random_features.feature_logits(query) < -600.0)
+
+    actual = attention(query, key, value)
+    if causal:
+        expected = torch.tensor([[[[1.0], [2.0], [3.0], [4.0]]]])
+    else:
+        expected = torch.full_like(actual, 4.0)
+    torch.testing.assert_close(actual, expected)
+
+    actual.square().sum().backward()
+    assert value.grad is not None
+    assert torch.all(torch.isfinite(value.grad))
+    assert torch.count_nonzero(value.grad) > 0
+
+
+def test_empty_causal_state_recovers_with_negative_key_scales() -> None:
+    """A masked prefix cannot pin later causal key stabilization at zero."""
+    attention = DarkformerKernelAttention(
+        head_dim=2,
+        num_heads=1,
+        num_features=4,
+        causal=True,
+        causal_chunk_size=4,
+        deterministic=True,
+    )
+    with torch.no_grad():
+        attention.geometry.copy_(30.0 * torch.eye(2).unsqueeze(0))
+        attention.random_features.projection_matrix.zero_()
+    prefix = torch.ones(1, 1, 2, 2)
+    prefix_value = torch.ones(1, 1, 2, 1)
+    prefix_mask = torch.zeros(1, 2, dtype=torch.bool)
+
+    prefix_output, state = attention.forward_with_state(
+        prefix,
+        prefix,
+        prefix_value,
+        query_mask=prefix_mask,
+        key_mask=prefix_mask,
+    )
+    assert torch.count_nonzero(prefix_output) == 0
+    assert torch.all(torch.isfinite(state.key_log_scale))
+
+    continuation = torch.ones(1, 1, 2, 2)
+    continuation_value = torch.tensor([[[[2.0], [4.0]]]])
+    actual, state = attention.forward_with_state(
+        continuation,
+        continuation,
+        continuation_value,
+        state=state,
+    )
+
+    expected = torch.tensor([[[[2.0], [3.0]]]])
+    torch.testing.assert_close(actual, expected)
+    assert torch.all(torch.isfinite(state.key_log_scale))
+    assert torch.all(state.key_log_scale < 0.0)
+
+
 def test_exact_mode_matches_transformed_softmax_attention() -> None:
     """Exact mode applies softmax after the learned Mahalanobis transform."""
     generator = torch.Generator().manual_seed(19)
@@ -239,6 +318,46 @@ def test_whitening_calibrates_effective_kernel_inputs() -> None:
     identity = torch.eye(head_dim, dtype=query.dtype).expand(heads, -1, -1)
 
     torch.testing.assert_close(covariance, identity, rtol=1e-9, atol=1e-9)
+
+
+def test_scaled_whitening_calibrates_effective_kernel_inputs() -> None:
+    """Kernel-level geometry scaling is applied after attention calibration."""
+    generator = torch.Generator().manual_seed(22)
+    head_dim = 4
+    heads = 2
+    geometry_scale = head_dim**-0.25
+    attention = DarkformerKernelAttention(
+        head_dim=head_dim,
+        num_heads=heads,
+        num_features=8,
+        deterministic=True,
+    ).double()
+    query = torch.randn(
+        3,
+        heads,
+        64,
+        head_dim,
+        generator=generator,
+        dtype=torch.float64,
+    )
+
+    with pytest.warns(UserWarning, match="scaled whitening"):
+        attention.initialize_whitening_(
+            query,
+            regularization=0.0,
+            geometry_scale=geometry_scale,
+        )
+    transformed, _ = attention._transformed_query_key(query, query)
+    centered = transformed - transformed.mean(dim=(0, 2), keepdim=True)
+    covariance = torch.einsum("bhld,bhle->hde", centered, centered) / (
+        query.shape[0] * query.shape[2] - 1
+    )
+    expected = geometry_scale**2 * torch.eye(
+        head_dim,
+        dtype=query.dtype,
+    ).expand(heads, -1, -1)
+
+    torch.testing.assert_close(covariance, expected, rtol=1e-9, atol=1e-9)
 
 
 def test_auto_mode_routes_around_threshold(

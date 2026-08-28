@@ -286,6 +286,7 @@ class DataAwareRandomFeatures(nn.Module):
         key_mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
+        geometry_scale: float = 1.0,
     ) -> DataAwareRandomFeatures:
         """Initialize geometry from empirical query and key covariance.
 
@@ -300,6 +301,8 @@ class DataAwareRandomFeatures(nn.Module):
           key_mask: Valid key positions with shape `[batch, key_length]`.
           regularization: Nonnegative diagonal loading relative to mean variance.
           shrinkage: Weight assigned to an isotropic covariance target.
+          geometry_scale: Positive scale applied after inverse-covariance
+            whitening. The default ``1.0`` performs literal whitening.
 
         Returns:
           This module.
@@ -317,6 +320,8 @@ class DataAwareRandomFeatures(nn.Module):
             raise ValueError("regularization must be finite and nonnegative")
         if not 0.0 <= shrinkage <= 1.0 or not math.isfinite(shrinkage):
             raise ValueError("shrinkage must be finite and in [0, 1]")
+        if geometry_scale <= 0.0 or not math.isfinite(geometry_scale):
+            raise ValueError("geometry_scale must be finite and positive")
         self._validate_calibration_mask("query_mask", query_mask, query)
         query_covariance, query_degrees = self._empirical_covariance(
             query,
@@ -365,15 +370,27 @@ class DataAwareRandomFeatures(nn.Module):
             @ torch.diag_embed(eigenvalues.rsqrt())
             @ eigenvectors.transpose(-1, -2)
         )
-        warnings.warn(
-            "literal whitening targets unit transformed covariance, so the "
-            f"expected squared feature input norm is approximately head_dim="
-            f"{self.head_dim}; positive random-feature variance can grow "
-            "exponentially with this dimension",
-            UserWarning,
-            stacklevel=3,
-        )
-        self.geometry.copy_(inverse_root.to(self.geometry))
+        expected_squared_norm = self.head_dim * geometry_scale**2
+        if geometry_scale == 1.0:
+            warning = (
+                "literal whitening targets unit transformed covariance, so the "
+                f"expected squared feature input norm is approximately head_dim="
+                f"{self.head_dim}; positive random-feature variance can grow "
+                "exponentially with this dimension; consider geometry_scale="
+                f"{self.head_dim**-0.25:g} to preserve the usual score temperature "
+                f"or geometry_scale={self.head_dim**-0.5:g} to target unit expected "
+                "squared norm"
+            )
+        else:
+            warning = (
+                f"scaled whitening with geometry_scale={geometry_scale:g} targets "
+                f"transformed covariance {geometry_scale**2:g} * I, so the expected "
+                "squared feature input norm is approximately "
+                f"{expected_squared_norm:g}; this scale changes both attention "
+                "temperature and positive random-feature variance"
+            )
+        warnings.warn(warning, UserWarning, stacklevel=3)
+        self.geometry.copy_((geometry_scale * inverse_root).to(self.geometry))
         return self
 
     def _validate_inputs(
@@ -472,11 +489,14 @@ class DataAwareRandomFeatures(nn.Module):
                 )
                 maximum = valid_logits.amax(dim=(-2, -1), keepdim=True).detach()
                 maximum = torch.where(torch.isfinite(maximum), maximum, 0.0)
-            # A negative shift would make eps * exp(-maximum) overflow. With
-            # eps=0, underflowed attention rows are handled by normalization.
-            maximum = maximum.clamp_min(0.0)
+            # A negative shift is safe when there is no additive feature floor
+            # and is required to keep all-negative logits representable. With a
+            # positive floor it could make eps * exp(-maximum) overflow.
+            if self.eps > 0.0:
+                maximum = maximum.clamp_min(0.0)
             features = torch.exp(logits - maximum)
-            features = features + self.eps * torch.exp(-maximum)
+            if self.eps > 0.0:
+                features = features + self.eps * torch.exp(-maximum)
         else:
             features = torch.exp(logits) + self.eps
         features = features * self.num_features**-0.5

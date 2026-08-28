@@ -136,10 +136,11 @@ paths.
 The stabilized public feature maps rescale features by factors that cancel during
 normalized attention. For direct kernel estimation with feature inner products,
 use `stabilize=False` and `eps=0` to retain the unbiased Equation (3) estimator.
-The stabilizing shift is not allowed below zero because the correction term
-`eps * exp(-shift)` could otherwise overflow when `eps > 0`; the normalization
-fallback above protects the default `eps=0` attention path if all features still
-underflow.
+With the default `eps=0`, stabilization subtracts the actual maximum even when it
+is negative. This keeps an all-negative logit vector representable instead of
+letting every exponential underflow to zero. When `eps > 0`, the shift is clamped
+at zero because the rescaled correction `eps * exp(-shift)` could otherwise
+overflow. The same policy is used by noncausal features and causal running state.
 
 ### Data-aware initialization
 
@@ -151,45 +152,49 @@ whitening as the initialization used in its experiments.
 
 The high-level attention initializers first apply the same $d_h^{-1/4}$ scaling
 used by the kernel. They estimate the pooled within-query and within-key covariance
-$\Lambda$ and set $M$ to a regularized symmetric $\Lambda^{-1/2}$. If queries and
-keys have the same covariance, as assumed by Proposition C.1, this gives
+$\Lambda$ and set $M$ to a regularized symmetric inverse root with an explicit
+post-whitening scale $s$:
 
 ```math
-\mathrm{Cov}(Mq)=\mathrm{Cov}(Mk)=I.
+M=s\Lambda^{-1/2},\qquad
+\mathrm{Cov}(Mq)=\mathrm{Cov}(Mk)=s^2I.
 ```
 
 Here $q$ and $k$ denote the scaled kernel inputs. If their empirical covariances
 differ, the pooled estimate is a symmetric compromise and does not whiten both
-distributions exactly.
+distributions exactly. Pass $s$ as `geometry_scale`. The default remains `1.0`
+for backward compatibility and literal Proposition C.1 whitening.
 
-Literal whitening does not preserve the pre-calibration attention temperature.
-If raw projected queries have covariance $\Lambda_0$, unregularized calibration
+For raw projected queries with covariance $\Lambda_0$, unregularized calibration
 sets
 
 ```math
-M=d_h^{1/4}\Lambda_0^{-1/2},
+M=s\,d_h^{1/4}\Lambda_0^{-1/2}.
 ```
 
-so the calibrated score is $q_0^\mathsf{T}\Lambda_0^{-1}k_0$ rather than
-$q_0^\mathsf{T}\Lambda_0^{-1}k_0/\sqrt{d_h}$. Leave the identity initialization
-in place when a temperature-preserving start is more important than literal
-Proposition C.1 whitening.
+The calibrated score is therefore
+$s^2q_0^\mathsf{T}\Lambda_0^{-1}k_0$, while the expected squared transformed norm
+is approximately $d_hs^2$. Useful scale policies are:
 
-Literal whitening can also put the finite positive-random-feature estimator in a
-very high-variance regime. It targets unit covariance for each transformed
-coordinate, so
+| Policy | `geometry_scale` | Expected $\lVert Mq\rVert^2$ | Effect |
+| :--- | :--- | :--- | :--- |
+| Literal Proposition C.1 | `1.0` | $d_h$ | Unit covariance; highest dynamic range |
+| Temperature preserving | `head_dim**-0.25` | $\sqrt{d_h}$ | Restores the usual $1/\sqrt{d_h}$ Mahalanobis score scale |
+| Unit expected norm | `head_dim**-0.5` | $1$ | Lower feature variance, but colder attention |
 
-```math
-\mathbb{E}\lVert Mq\rVert^2 \approx d_h.
-```
+The variance of exponential random features grows rapidly with the transformed
+norm, so literal whitening can be impractical at ordinary head dimensions.
+`initialize_whitening_` emits a warning reporting the selected scale and expected
+norm. Covariance `shrinkage` is different: it regularizes the estimated covariance
+toward an isotropic shape but does not uniformly reduce $M$.
 
-The variance of exponential random features grows exponentially with this norm;
-the effect is already severe for ordinary head dimensions. Unit covariance also
-sits outside the $\lambda_i < 1/2$ integrability condition used by the paper's
-optimality result. `initialize_whitening_` therefore emits a warning containing
-the configured `head_dim`. Leave the identity initialization in place unless
-literal Proposition C.1 whitening is specifically intended, and validate any
-calibrated geometry with the feature count and data distribution used in training.
+Proposition C.1's whitening geometry is also distinct from Theorem 3.2's
+variance-optimal proposal
+$\Sigma^*=(I+2\Lambda)(I-2\Lambda)^{-1}$. DARKformer couples kernel geometry and
+sampling covariance through the same learned matrix, so `initialize_whitening_`
+does not implement that separate proposal. `geometry_scale` rescales the coupled
+geometry; it is not a substitute for $\Sigma^*$. Validate any calibrated geometry
+with the feature count and data distribution used in training.
 
 ```python
 import torch
@@ -201,6 +206,7 @@ model = DarkformerLM(
     dim=512,
     depth=8,
     heads=8,
+    head_dim=64,
     num_features=256,
     max_seq_len=4096,
 ).to("cuda")
@@ -216,6 +222,7 @@ model.initialize_whitening_(
     calibration_tokens,
     regularization=1e-4,
     shrinkage=0.01,
+    geometry_scale=64**-0.25,
 )
 ```
 
@@ -531,7 +538,8 @@ paper's model finetuning experiments.
 Performer and DARKformer use the same feature count, IID or orthogonal feature
 structure, projection seeds, and additive feature floor. Performer projections
 are injected explicitly instead of using its constructor defaults. DARKformer is
-whitened from a separate calibration sample, and calibration is excluded from
+whitened from a separate calibration sample using the configurable
+`--geometry-scale` (literal `1.0` by default), and calibration is excluded from
 timed regions. Performance rows report the median and IQR across repeated blocked
 timings. GPU memory is the incremental peak allocation during one warmed forward,
 not total process or model memory.
@@ -562,7 +570,8 @@ PyTorch 2.12.0+cu130, Python 3.12.13, `performer-pytorch` 1.1.4, and
 The noncausal workload used batch size 1, 8 heads, head dimension 64, 256 IID
 features, `eps=0`, data seed 17, and projection seed 1,000. Query and key inputs
 had covariance condition number 16. DARKformer used a disjoint length-512
-calibration sample with regularization $10^{-4}$ and shrinkage $0.01$.
+calibration sample with regularization $10^{-4}$, shrinkage $0.01$, and literal
+`geometry_scale=1.0`.
 Performance inputs used bfloat16. Performer kept bfloat16 features and
 reductions; DARKformer used bfloat16 projections with float32 features and
 reductions. Each latency is the median of five blocked timing repeats after
