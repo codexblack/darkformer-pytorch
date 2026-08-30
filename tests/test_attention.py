@@ -16,6 +16,28 @@ pytestmark = pytest.mark.filterwarnings(
 )
 
 
+def test_public_attention_defaults_to_256_token_causal_chunks() -> None:
+    """Public attention constructors use the benchmarked causal chunk default."""
+    kernel = DarkformerKernelAttention(head_dim=4, num_heads=1)
+    self_attention = SelfAttention(dim=4, heads=1)
+    cross_attention = CrossAttention(dim=4, heads=1)
+
+    assert kernel.causal_chunk_size == 256
+    assert self_attention.attention.causal_chunk_size == 256
+    assert cross_attention.attention.causal_chunk_size == 256
+
+
+def test_public_attention_defaults_to_orthogonal_features() -> None:
+    """Public attention constructors enable variance-reduced projections."""
+    kernel = DarkformerKernelAttention(head_dim=4, num_heads=1)
+    self_attention = SelfAttention(dim=4, heads=1)
+    cross_attention = CrossAttention(dim=4, heads=1)
+
+    assert kernel.random_features.orthogonal
+    assert self_attention.attention.random_features.orthogonal
+    assert cross_attention.attention.random_features.orthogonal
+
+
 def _feature_attention_reference(
     query_features: torch.Tensor,
     key_features: torch.Tensor,
@@ -156,6 +178,73 @@ def test_causal_linear_attention_matches_prefix_reference() -> None:
     assert torch.count_nonzero(actual[:, :, 3:]) == 0
 
 
+def test_causal_chunk_rescaling_handles_an_abrupt_logit_rise() -> None:
+    """A later key can raise the running scale without overflowing a chunk."""
+    attention = DarkformerKernelAttention(
+        head_dim=1,
+        num_heads=1,
+        num_features=1,
+        causal=True,
+        causal_chunk_size=4,
+        projection_seed=19,
+        deterministic=True,
+    )
+    with torch.no_grad():
+        attention.geometry.fill_(1.0)
+        attention.random_features.projection_matrix.fill_(20.0)
+    query = torch.zeros(1, 1, 4, 1)
+    key = torch.tensor([[[[0.0], [20.0], [0.0], [0.0]]]])
+    value = torch.tensor([[[[1.0], [3.0], [5.0], [7.0]]]])
+    key_logits = attention.random_features.feature_logits(key)
+    assert key_logits[0, 0, 1, 0] - key_logits[0, 0, 0, 0] > 100.0
+
+    actual = attention(query, key, value)
+    expected_values = []
+    for index in range(key.shape[2]):
+        weights = torch.softmax(key_logits[0, 0, : index + 1, 0], dim=0)
+        expected_values.append(weights @ value[0, 0, : index + 1, 0])
+    expected = torch.stack(expected_values).reshape_as(actual)
+
+    assert torch.all(torch.isfinite(actual))
+    torch.testing.assert_close(actual, expected)
+
+
+def test_causal_linear_attention_compiles_as_one_full_graph() -> None:
+    """Running-scale updates avoid data-dependent graph breaks."""
+    attention = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        num_features=8,
+        causal=True,
+        causal_chunk_size=4,
+        projection_seed=23,
+        deterministic=True,
+    ).eval()
+    generator = torch.Generator().manual_seed(29)
+    query = torch.randn(1, 1, 8, 4, generator=generator)
+    key = torch.randn(1, 1, 8, 4, generator=generator)
+    value = torch.randn(1, 1, 8, 3, generator=generator)
+    mask = torch.tensor([[True, True, False, True, True, True, False, True]])
+    expected = attention(
+        query,
+        key,
+        value,
+        query_mask=mask,
+        key_mask=mask,
+    )
+
+    compiled = torch.compile(attention, backend="eager", fullgraph=True)
+    actual = compiled(
+        query,
+        key,
+        value,
+        query_mask=mask,
+        key_mask=mask,
+    )
+
+    torch.testing.assert_close(actual, expected)
+
+
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("eps", [0.0, 1e-4])
 def test_large_geometry_does_not_collapse_linear_attention(
@@ -277,8 +366,8 @@ def test_exact_mode_matches_transformed_softmax_attention() -> None:
     torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-6)
 
 
-def test_whitening_calibrates_effective_kernel_inputs() -> None:
-    """Kernel-level calibration whitens inputs after attention scaling."""
+def test_default_whitening_preserves_effective_score_temperature() -> None:
+    """Default kernel calibration uses scaled rather than literal whitening."""
     generator = torch.Generator().manual_seed(21)
     head_dim = 4
     heads = 2
@@ -315,12 +404,58 @@ def test_whitening_calibrates_effective_kernel_inputs() -> None:
     covariance = torch.einsum("bhld,bhle->hde", centered, centered) / (
         query.shape[0] * query.shape[2] - 1
     )
+    expected = head_dim**-0.5 * torch.eye(
+        head_dim,
+        dtype=query.dtype,
+    ).expand(heads, -1, -1)
+
+    torch.testing.assert_close(covariance, expected, rtol=1e-9, atol=1e-9)
+
+
+def test_kernel_attention_initializes_variance_optimal_proposal() -> None:
+    """Kernel-level proposal calibration uses the scaled transformed inputs."""
+    generator = torch.Generator().manual_seed(211)
+    head_dim = 4
+    heads = 2
+    attention = DarkformerKernelAttention(
+        head_dim=head_dim,
+        num_heads=heads,
+        num_features=16,
+        projection_seed=223,
+        deterministic=True,
+    ).double()
+    query = 0.2 * torch.randn(
+        4,
+        heads,
+        32,
+        head_dim,
+        generator=generator,
+        dtype=torch.float64,
+    )
+
+    attention.initialize_variance_optimal_proposal_(query)
+
+    transformed, _ = attention._transformed_query_key(query, query)
+    centered = transformed - transformed.mean(dim=(0, 2), keepdim=True)
+    covariance = torch.einsum("bhld,bhle->hde", centered, centered) / (
+        query.shape[0] * query.shape[2] - 1
+    )
     identity = torch.eye(head_dim, dtype=query.dtype).expand(heads, -1, -1)
+    expected = torch.linalg.solve(
+        identity - 2.0 * covariance,
+        identity + 2.0 * covariance,
+    )
 
-    torch.testing.assert_close(covariance, identity, rtol=1e-9, atol=1e-9)
+    torch.testing.assert_close(
+        attention.proposal_covariance(),
+        expected,
+        rtol=1e-9,
+        atol=1e-9,
+    )
 
 
-def test_scaled_whitening_calibrates_effective_kernel_inputs() -> None:
+@pytest.mark.filterwarnings("error")
+def test_explicit_default_whitening_calibrates_effective_kernel_inputs() -> None:
     """Kernel-level geometry scaling is applied after attention calibration."""
     generator = torch.Generator().manual_seed(22)
     head_dim = 4
@@ -341,12 +476,11 @@ def test_scaled_whitening_calibrates_effective_kernel_inputs() -> None:
         dtype=torch.float64,
     )
 
-    with pytest.warns(UserWarning, match="scaled whitening"):
-        attention.initialize_whitening_(
-            query,
-            regularization=0.0,
-            geometry_scale=geometry_scale,
-        )
+    attention.initialize_whitening_(
+        query,
+        regularization=0.0,
+        geometry_scale=geometry_scale,
+    )
     transformed, _ = attention._transformed_query_key(query, query)
     centered = transformed - transformed.mean(dim=(0, 2), keepdim=True)
     covariance = torch.einsum("bhld,bhle->hde", centered, centered) / (
@@ -897,6 +1031,52 @@ def test_causal_state_rejects_whitening_change() -> None:
         )
 
 
+def test_causal_state_rejects_proposal_change() -> None:
+    """A causal state cannot outlive its random-feature proposal."""
+    attention = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        causal=True,
+        deterministic=True,
+    )
+    tensor = 0.1 * torch.randn(1, 1, 4, 4)
+    _, state = attention.forward_with_state(tensor, tensor, tensor)
+
+    attention.initialize_variance_optimal_proposal_(tensor, tensor)
+
+    with pytest.raises(RuntimeError, match="attention geometry"):
+        attention.forward_with_state(
+            tensor[:, :, :1],
+            tensor[:, :, :1],
+            tensor[:, :, :1],
+            state=state,
+        )
+
+
+def test_causal_state_rejects_proposal_reset() -> None:
+    """Resetting proposal sampling invalidates an existing recurrent state."""
+    attention = DarkformerKernelAttention(
+        head_dim=4,
+        num_heads=1,
+        causal=True,
+        deterministic=True,
+    )
+    tensor = 0.1 * torch.randn(1, 1, 4, 4)
+    attention.initialize_variance_optimal_proposal_(tensor, tensor)
+    _, state = attention.forward_with_state(tensor, tensor, tensor)
+
+    attention.reset_variance_optimal_proposal_()
+
+    assert not attention.random_features.proposal_is_active
+    with pytest.raises(RuntimeError, match="attention geometry"):
+        attention.forward_with_state(
+            tensor[:, :, :1],
+            tensor[:, :, :1],
+            tensor[:, :, :1],
+            state=state,
+        )
+
+
 def test_context_state_rejects_whitening_change() -> None:
     """A context state cannot outlive its attention geometry."""
     attention = DarkformerKernelAttention(
@@ -1030,6 +1210,64 @@ def test_bfloat16_linear_attention_returns_model_dtype() -> None:
 
     assert output.dtype == torch.bfloat16
     assert torch.all(torch.isfinite(output))
+
+
+@pytest.mark.parametrize("causal", [False, True])
+def test_bfloat16_linear_attention_matches_float32_reference(causal: bool) -> None:
+    """Model-dtype features retain close agreement with an fp32 reference."""
+    generator = torch.Generator().manual_seed(113)
+
+    def make_attention() -> DarkformerKernelAttention:
+        return DarkformerKernelAttention(
+            head_dim=8,
+            num_heads=2,
+            num_features=64,
+            orthogonal_features=False,
+            causal=causal,
+            causal_chunk_size=16,
+            eps=1e-4,
+            projection_seed=127,
+            deterministic=True,
+        )
+
+    attention = make_attention().bfloat16()
+    reference = make_attention()
+    reference.load_state_dict(attention.state_dict())
+    query = (0.5 * torch.randn(2, 2, 32, 8, generator=generator)).bfloat16()
+    key = (0.5 * torch.randn(2, 2, 32, 8, generator=generator)).bfloat16()
+    value = torch.randn(2, 2, 32, 5, generator=generator).bfloat16()
+    mask = torch.rand(2, 32, generator=generator) > 0.2
+
+    if causal:
+        actual, state = attention.forward_with_state(
+            query,
+            key,
+            value,
+            query_mask=mask,
+            key_mask=mask,
+        )
+        assert state.key_sum.dtype == torch.bfloat16
+        assert state.key_value_sum.dtype == torch.bfloat16
+        assert state.key_log_scale.dtype == torch.float32
+    else:
+        actual = attention(
+            query,
+            key,
+            value,
+            query_mask=mask,
+            key_mask=mask,
+        )
+    expected = reference(
+        query.float(),
+        key.float(),
+        value.float(),
+        query_mask=mask,
+        key_mask=mask,
+    )
+
+    assert actual.dtype == torch.bfloat16
+    assert torch.all(torch.isfinite(actual))
+    torch.testing.assert_close(actual.float(), expected, rtol=2e-2, atol=1e-2)
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")

@@ -5,7 +5,10 @@ import math
 import pytest
 import torch
 
-from darkformer_pytorch.random_features import DataAwareRandomFeatures
+from darkformer_pytorch.random_features import (
+    DataAwareRandomFeatures,
+    _gaussian_projection,
+)
 
 
 def test_identity_covariance_initialization() -> None:
@@ -24,20 +27,54 @@ def test_identity_covariance_initialization() -> None:
     assert "projection_matrix" in dict(random_features.named_buffers())
 
 
-def test_paper_faithful_feature_defaults() -> None:
-    """The default estimator uses IID features without an additive floor."""
+def test_variance_reduced_feature_defaults() -> None:
+    """The default estimator uses orthogonal features without an additive floor."""
     random_features = DataAwareRandomFeatures(
         head_dim=4,
         num_heads=2,
         num_features=16,
     )
 
-    assert not random_features.orthogonal
+    assert random_features.orthogonal
     assert random_features.eps == 0.0
 
 
-def test_whitening_initialization_matches_empirical_inverse_covariance() -> None:
-    """Calibration sets geometry to the empirical inverse square root."""
+def test_orthogonal_projection_is_invariant_to_qr_sign_choice(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The projection is invariant to an equivalent QR sign convention."""
+    seed = 3
+    baseline = _gaussian_projection(
+        5,
+        3,
+        orthogonal=True,
+        generator=torch.Generator().manual_seed(seed),
+    )
+    original_qr = torch.linalg.qr
+
+    def fake_qr(
+        unstructured: torch.Tensor,
+        *,
+        mode: str,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        assert mode == "reduced"
+        orthogonal, upper = original_qr(unstructured, mode="reduced")
+        signs = unstructured.new_tensor([-1.0, 1.0, -1.0])
+        return orthogonal * signs, signs[:, None] * upper
+
+    monkeypatch.setattr(torch.linalg, "qr", fake_qr)
+    flipped = _gaussian_projection(
+        5,
+        3,
+        orthogonal=True,
+        generator=torch.Generator().manual_seed(seed),
+    )
+
+    torch.testing.assert_close(flipped, baseline, rtol=0, atol=0)
+
+
+def test_default_whitening_uses_temperature_preserving_scale() -> None:
+    """Low-level whitening uses the high-level policy's geometry scale."""
     generator = torch.Generator().manual_seed(5)
     samples = torch.randn(8, 2, 128, 3, generator=generator)
     mixing = torch.tensor(
@@ -50,14 +87,14 @@ def test_whitening_initialization_matches_empirical_inverse_covariance() -> None
         num_features=16,
     )
 
-    with pytest.warns(UserWarning, match="head_dim=3"):
-        random_features.initialize_whitening_(samples, regularization=0.0)
+    random_features.initialize_whitening_(samples, regularization=0.0)
     transformed = samples @ random_features.geometry.transpose(-1, -2)
     centered = transformed - transformed.mean(dim=(0, 2), keepdim=True)
     covariance = torch.einsum("bhld,bhle->hde", centered, centered)
     covariance = covariance / (samples.shape[0] * samples.shape[2] - 1)
 
-    expected = torch.eye(3).expand(2, -1, -1)
+    geometry_scale = 3**-0.25
+    expected = geometry_scale**2 * torch.eye(3).expand(2, -1, -1)
     torch.testing.assert_close(covariance, expected, rtol=2e-4, atol=2e-4)
 
 
@@ -100,6 +137,127 @@ def test_whitening_rejects_invalid_geometry_scale(geometry_scale: float) -> None
             torch.randn(2, 1, 4, 3),
             geometry_scale=geometry_scale,
         )
+
+
+def test_variance_optimal_proposal_matches_theorem_3_2() -> None:
+    """The separate proposal uses (I + 2 Lambda)(I - 2 Lambda)^-1."""
+    generator = torch.Generator().manual_seed(8)
+    head_dim = 4
+    samples = 0.3 * torch.randn(4, 2, 32, head_dim, generator=generator)
+    random_features = DataAwareRandomFeatures(
+        head_dim=head_dim,
+        num_heads=2,
+        num_features=16,
+        projection_seed=9,
+    )
+    with torch.no_grad():
+        random_features.geometry[0].copy_(
+            torch.diag(torch.tensor([0.8, 1.0, 1.1, 0.9]))
+        )
+        random_features.geometry[1].copy_(
+            torch.tensor(
+                [
+                    [1.0, 0.1, 0.0, 0.0],
+                    [0.0, 0.9, 0.1, 0.0],
+                    [0.0, 0.0, 1.1, 0.1],
+                    [0.1, 0.0, 0.0, 0.8],
+                ]
+            )
+        )
+
+    random_features.initialize_variance_optimal_proposal_(samples)
+
+    transformed = torch.matmul(
+        samples * head_dim**-0.25,
+        random_features.geometry.transpose(-1, -2),
+    )
+    centered = transformed - transformed.mean(dim=(0, 2), keepdim=True)
+    covariance = torch.einsum("bhld,bhle->hde", centered, centered)
+    covariance = covariance / (samples.shape[0] * samples.shape[2] - 1)
+    identity = torch.eye(head_dim).expand(2, -1, -1)
+    expected = torch.linalg.solve(
+        identity - 2.0 * covariance,
+        identity + 2.0 * covariance,
+    )
+
+    assert random_features.proposal_is_active
+    torch.testing.assert_close(
+        random_features.proposal_covariance(),
+        expected,
+        rtol=2e-5,
+        atol=2e-5,
+    )
+
+
+def test_variance_optimal_proposal_supports_low_rank_geometry() -> None:
+    """The proposal is full-density in the geometry's feature coordinates."""
+    with pytest.warns(UserWarning, match="importance-sampling interpretation"):
+        random_features = DataAwareRandomFeatures(
+            head_dim=4,
+            num_heads=2,
+            num_features=16,
+            rank=2,
+            projection_seed=10,
+        )
+    samples = 0.1 * torch.randn(4, 2, 16, 4)
+
+    random_features.initialize_variance_optimal_proposal_(samples)
+
+    assert random_features.proposal_is_active
+    assert random_features.proposal_covariance().shape == (2, 2, 2)
+
+
+def test_variance_optimal_proposal_preserves_kernel_expectation() -> None:
+    """Density-ratio features remain unbiased for the configured kernel."""
+    random_features = DataAwareRandomFeatures(
+        head_dim=1,
+        num_heads=1,
+        num_features=65_536,
+        orthogonal=False,
+        projection_seed=31,
+    )
+    calibration_value = math.sqrt(0.125)
+    calibration = torch.tensor(
+        [[[[-calibration_value], [calibration_value]]]],
+    )
+    random_features.initialize_variance_optimal_proposal_(calibration)
+    query = torch.tensor([[[[0.2]]]])
+    key = torch.tensor([[[[0.1]]]])
+
+    query_features, key_features = random_features(
+        query,
+        key,
+        stabilize=False,
+    )
+
+    estimate = (query_features * key_features).sum()
+    expected = torch.exp(query.flatten() @ key.flatten())
+    torch.testing.assert_close(estimate, expected, rtol=0.01, atol=0.01)
+
+
+def test_variance_optimal_proposal_can_reset_to_isotropic_sampling() -> None:
+    """Resetting removes the proposal and its derived caches."""
+    random_features = DataAwareRandomFeatures(2, 2, 16, projection_seed=37)
+    calibration = 0.1 * torch.randn(4, 2, 8, 2)
+    random_features.initialize_variance_optimal_proposal_(calibration)
+
+    returned = random_features.reset_variance_optimal_proposal_()
+
+    assert returned is random_features
+    assert not random_features.proposal_is_active
+    assert random_features._proposal_projection.numel() == 0
+    assert random_features._proposal_log_weights.numel() == 0
+    expected = torch.eye(2).expand(2, -1, -1)
+    torch.testing.assert_close(random_features.proposal_covariance(), expected)
+
+
+def test_variance_optimal_proposal_rejects_nonnormalizable_covariance() -> None:
+    """The closed-form proposal exists only below the half-variance boundary."""
+    random_features = DataAwareRandomFeatures(1, 1, 16)
+    calibration = torch.tensor([[[[-0.5], [0.5]]]])
+
+    with pytest.raises(ValueError, match=r"eigenvalue to be below 0\.5"):
+        random_features.initialize_variance_optimal_proposal_(calibration)
 
 
 @pytest.mark.filterwarnings(
@@ -146,7 +304,13 @@ def test_shared_whitening_pools_head_means() -> None:
     covariance = torch.einsum("bhld,bhle->de", centered, centered)
     covariance = covariance / (samples.numel() // samples.shape[-1] - 1)
 
-    torch.testing.assert_close(covariance, torch.eye(2), rtol=2e-4, atol=2e-4)
+    geometry_scale = 2**-0.25
+    torch.testing.assert_close(
+        covariance,
+        geometry_scale**2 * torch.eye(2),
+        rtol=2e-4,
+        atol=2e-4,
+    )
 
 
 def test_low_rank_geometry_warns_and_rejects_whitening() -> None:
@@ -388,6 +552,130 @@ def test_projection_fixed_cache_is_restored_from_state_dict() -> None:
     restored.load_state_dict(fixed.state_dict())
 
     assert restored.projection_is_fixed
+
+
+def test_proposal_caches_refresh_after_state_load_and_redraw() -> None:
+    """Derived proposal samples follow the restored and redrawn base samples."""
+    calibration_value = math.sqrt(0.125)
+    calibration = torch.tensor(
+        [[[[-calibration_value], [calibration_value]]]],
+    )
+    original = DataAwareRandomFeatures(1, 1, 32, projection_seed=67)
+    original.initialize_variance_optimal_proposal_(calibration)
+    restored = DataAwareRandomFeatures(1, 1, 32, projection_seed=71)
+
+    restored.load_state_dict(original.state_dict())
+
+    assert restored.proposal_is_active
+    torch.testing.assert_close(
+        restored._proposal_projection,
+        original._proposal_projection,
+        rtol=0,
+        atol=0,
+    )
+    torch.testing.assert_close(
+        restored._proposal_log_weights,
+        original._proposal_log_weights,
+        rtol=0,
+        atol=0,
+    )
+    cached_projection = restored._proposal_projection.clone()
+
+    restored.redraw_projection_(generator=torch.Generator().manual_seed(73))
+
+    assert not torch.equal(restored._proposal_projection, cached_projection)
+    expected_projection = torch.matmul(
+        restored.projection_matrix.unsqueeze(0),
+        restored._proposal_root.transpose(-1, -2),
+    )
+    torch.testing.assert_close(
+        restored._proposal_projection,
+        expected_projection,
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_proposal_log_weight_precision_survives_module_casts() -> None:
+    """Derived density weights keep their accumulation dtype after casting."""
+    calibration_value = math.sqrt(0.125)
+    calibration = torch.tensor(
+        [[[[-calibration_value], [calibration_value]]]],
+    )
+    random_features = DataAwareRandomFeatures(1, 1, 32, projection_seed=77)
+    random_features.initialize_variance_optimal_proposal_(calibration)
+
+    random_features.half()
+
+    assert random_features._proposal_projection.dtype == torch.float16
+    assert random_features._proposal_log_weights.dtype == torch.float32
+
+    random_features.redraw_projection_(generator=torch.Generator().manual_seed(78))
+
+    assert random_features._proposal_log_weights.dtype == torch.float32
+
+
+def test_stabilized_bfloat16_features_preserve_activation_dtype() -> None:
+    """Stable fp32 logits do not force feature-sized activations to fp32."""
+    generator = torch.Generator().manual_seed(81)
+    random_features = DataAwareRandomFeatures(
+        4,
+        2,
+        32,
+        orthogonal=False,
+        projection_seed=83,
+    ).bfloat16()
+    query = (0.5 * torch.randn(2, 2, 5, 4, generator=generator)).bfloat16()
+    key = (0.5 * torch.randn(2, 2, 7, 4, generator=generator)).bfloat16()
+
+    query_features, key_features = random_features(query, key)
+
+    assert query_features.dtype == torch.bfloat16
+    assert key_features.dtype == torch.bfloat16
+    assert torch.all(torch.isfinite(query_features))
+    assert torch.all(torch.isfinite(key_features))
+
+    # The correction and maxima remain fp32; only the already-stabilized,
+    # nonpositive exponent is evaluated in the activation dtype.
+    query_logits = random_features.feature_logits(query)
+    key_logits = random_features.feature_logits(key)
+    assert query_logits.dtype == torch.float32
+    assert key_logits.dtype == torch.float32
+    expected_query = (
+        torch.exp(query_logits - query_logits.amax(dim=-1, keepdim=True))
+        * random_features.num_features**-0.5
+    )
+    expected_key = (
+        torch.exp(key_logits - key_logits.amax(dim=(-2, -1), keepdim=True))
+        * random_features.num_features**-0.5
+    )
+    torch.testing.assert_close(
+        query_features.float(),
+        expected_query,
+        rtol=2e-2,
+        atol=2e-4,
+    )
+    torch.testing.assert_close(
+        key_features.float(),
+        expected_key,
+        rtol=2e-2,
+        atol=2e-4,
+    )
+
+
+def test_checkpoint_without_proposal_state_loads_as_isotropic() -> None:
+    """Checkpoints predating separate proposals retain their original behavior."""
+    original = DataAwareRandomFeatures(4, 2, 16, projection_seed=79)
+    state_dict = original.state_dict()
+    del state_dict["_proposal_root"]
+    del state_dict["_proposal_active"]
+    restored = DataAwareRandomFeatures(4, 2, 16, projection_seed=83)
+
+    restored.load_state_dict(state_dict)
+
+    assert not restored.proposal_is_active
+    expected = torch.eye(4).expand(2, -1, -1)
+    torch.testing.assert_close(restored.proposal_covariance(), expected)
 
 
 def test_geometry_receives_finite_nonzero_gradients() -> None:

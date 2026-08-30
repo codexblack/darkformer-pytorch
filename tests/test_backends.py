@@ -3,12 +3,70 @@
 import math
 from collections.abc import Iterator
 from contextlib import contextmanager
+from types import SimpleNamespace
 from typing import cast
 
 import pytest
 import torch
 
 from darkformer_pytorch import backends
+
+
+def test_load_flash3_supports_packaged_interface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def sentinel(*args: object, **kwargs: object) -> torch.Tensor:
+        del args, kwargs
+        return torch.empty(0)
+
+    imported: list[str] = []
+
+    def fake_import(module_name: str) -> SimpleNamespace:
+        imported.append(module_name)
+        assert module_name == "flash_attn_3.flash_attn_interface"
+        return SimpleNamespace(flash_attn_func=sentinel)
+
+    backends._load_flash3.cache_clear()
+    monkeypatch.setattr(backends, "import_module", fake_import)
+    try:
+        function, error = backends._load_flash3()
+    finally:
+        backends._load_flash3.cache_clear()
+
+    assert function is sentinel
+    assert error is None
+    assert imported == ["flash_attn_3.flash_attn_interface"]
+
+
+def test_load_flash3_falls_back_to_legacy_top_level_interface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def sentinel(*args: object, **kwargs: object) -> torch.Tensor:
+        del args, kwargs
+        return torch.empty(0)
+
+    imported: list[str] = []
+
+    def fake_import(module_name: str) -> SimpleNamespace:
+        imported.append(module_name)
+        if module_name == "flash_attn_3.flash_attn_interface":
+            raise ImportError("packaged interface is unavailable")
+        assert module_name == "flash_attn_interface"
+        return SimpleNamespace(flash_attn_func=sentinel)
+
+    backends._load_flash3.cache_clear()
+    monkeypatch.setattr(backends, "import_module", fake_import)
+    try:
+        function, error = backends._load_flash3()
+    finally:
+        backends._load_flash3.cache_clear()
+
+    assert function is sentinel
+    assert error is None
+    assert imported == [
+        "flash_attn_3.flash_attn_interface",
+        "flash_attn_interface",
+    ]
 
 
 def _reference_attention(
@@ -215,7 +273,7 @@ def test_auto_uses_sdpa_for_padding_mask(
     assert torch.count_nonzero(output[:, :, -1]) == 0
 
 
-def test_auto_prefers_flash3_and_converts_layout(
+def test_auto_prefers_flash3_converts_layout_and_unwraps_tuple(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     query = torch.randn(2, 3, 5, 4)
@@ -240,7 +298,7 @@ def test_auto_prefers_flash3_and_converts_layout(
         softmax_scale: float,
         causal: bool,
         deterministic: bool,
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         calls.append(
             (
                 flash_query.shape,
@@ -251,7 +309,11 @@ def test_auto_prefers_flash3_and_converts_layout(
                 deterministic,
             )
         )
-        return flash_value
+        softmax_lse = torch.zeros(
+            flash_value.shape[:3],
+            dtype=torch.float32,
+        )
+        return flash_value, softmax_lse
 
     monkeypatch.setattr(backends, "_flash3_unavailable_reason", lambda *args: None)
     monkeypatch.setattr(backends, "_load_flash3", lambda: (fake_flash3, None))
@@ -288,7 +350,7 @@ def test_auto_prefers_flash3_and_converts_layout(
     torch.testing.assert_close(output, expected)
 
 
-def test_auto_ignores_an_all_true_key_mask_for_flash_dispatch(
+def test_auto_treats_an_all_true_key_mask_as_a_padding_mask(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     query = torch.randn(1, 2, 3, 4)
@@ -297,42 +359,162 @@ def test_auto_ignores_an_all_true_key_mask_for_flash_dispatch(
     key_mask = torch.ones(1, 3, dtype=torch.bool)
     received_masks: list[torch.Tensor | None] = []
 
-    def availability(
+    def flash3_availability(
         _query: torch.Tensor,
         _key: torch.Tensor,
         _value: torch.Tensor,
         _query_mask: torch.Tensor | None,
         dispatched_key_mask: torch.Tensor | None,
         _dropout_p: float,
-    ) -> None:
+    ) -> str:
         received_masks.append(dispatched_key_mask)
+        return "padding masks are unsupported"
 
-    def fake_flash3(
+    def flash2_availability(
         _query: torch.Tensor,
         _key: torch.Tensor,
-        flash_value: torch.Tensor,
-        *,
-        softmax_scale: float,
-        causal: bool,
-        deterministic: bool,
+        _value: torch.Tensor,
+        _query_mask: torch.Tensor | None,
+        dispatched_key_mask: torch.Tensor | None,
+    ) -> str:
+        received_masks.append(dispatched_key_mask)
+        return "padding masks are unsupported"
+
+    monkeypatch.setattr(
+        backends,
+        "_flash3_unavailable_reason",
+        flash3_availability,
+    )
+    monkeypatch.setattr(
+        backends,
+        "_flash2_unavailable_reason",
+        flash2_availability,
+    )
+    monkeypatch.setattr(
+        backends,
+        "_load_flash3",
+        lambda: pytest.fail("FlashAttention 3 should not be loaded"),
+    )
+    monkeypatch.setattr(
+        backends,
+        "_load_flash2",
+        lambda: pytest.fail("FlashAttention 2 should not be loaded"),
+    )
+
+    expected = backends.exact_attention(
+        query,
+        key,
+        value,
+        causal=False,
+        dropout_p=0.0,
+        backend="sdpa",
+    )
+
+    def fail_all(
+        _mask: torch.Tensor,
+        *args: object,
+        **kwargs: object,
     ) -> torch.Tensor:
-        del softmax_scale, causal, deterministic
-        return flash_value
+        del args, kwargs
+        raise AssertionError("key_mask.all() must not be called")
 
-    monkeypatch.setattr(backends, "_flash3_unavailable_reason", availability)
-    monkeypatch.setattr(backends, "_load_flash3", lambda: (fake_flash3, None))
+    with monkeypatch.context() as context:
+        context.setattr(torch.Tensor, "all", fail_all)
+        output = backends.exact_attention(
+            query,
+            key,
+            value,
+            causal=False,
+            key_mask=key_mask,
+            dropout_p=0.0,
+        )
 
-    output = backends.exact_attention(
+    assert len(received_masks) == 2
+    assert received_masks[0] is key_mask
+    assert received_masks[1] is key_mask
+    torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.parametrize("backend", ["auto", "sdpa"])
+def test_nonflash_dispatch_does_not_reduce_key_mask(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: backends.AttentionBackend,
+) -> None:
+    query = torch.randn(1, 2, 3, 4)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    key_mask = torch.ones(1, 3, dtype=torch.bool)
+    expected = backends.exact_attention(
         query,
         key,
         value,
         causal=False,
         key_mask=key_mask,
         dropout_p=0.0,
+        backend="sdpa",
     )
 
-    assert received_masks == [None]
-    torch.testing.assert_close(output, value)
+    monkeypatch.setattr(
+        backends,
+        "_flash3_unavailable_reason",
+        lambda *args: "FlashAttention 3 is ineligible",
+    )
+    monkeypatch.setattr(
+        backends,
+        "_flash2_unavailable_reason",
+        lambda *args: "FlashAttention 2 is ineligible",
+    )
+
+    def fail_all(
+        _mask: torch.Tensor,
+        *args: object,
+        **kwargs: object,
+    ) -> torch.Tensor:
+        del args, kwargs
+        raise AssertionError("key_mask.all() must not be called")
+
+    with monkeypatch.context() as context:
+        context.setattr(torch.Tensor, "all", fail_all)
+        output = backends.exact_attention(
+            query,
+            key,
+            value,
+            causal=False,
+            key_mask=key_mask,
+            dropout_p=0.0,
+            backend=backend,
+        )
+
+    torch.testing.assert_close(output, expected)
+
+
+def test_masked_sdpa_compiles_as_a_full_graph() -> None:
+    query = torch.randn(1, 2, 3, 4)
+    key = torch.randn_like(query)
+    value = torch.randn_like(query)
+    key_mask = torch.tensor([[True, False, True]])
+
+    def masked_attention(
+        compiled_query: torch.Tensor,
+        compiled_key: torch.Tensor,
+        compiled_value: torch.Tensor,
+        compiled_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        return backends.exact_attention(
+            compiled_query,
+            compiled_key,
+            compiled_value,
+            causal=False,
+            key_mask=compiled_mask,
+            dropout_p=0.0,
+            backend="sdpa",
+        )
+
+    expected = masked_attention(query, key, value, key_mask)
+    compiled = torch.compile(masked_attention, backend="eager", fullgraph=True)
+    actual = compiled(query, key, value, key_mask)
+
+    torch.testing.assert_close(actual, expected)
 
 
 @pytest.mark.parametrize(
@@ -355,6 +537,92 @@ def test_cuda_version_requirement(
     monkeypatch.setattr(torch.version, "cuda", version)
 
     assert backends._cuda_version_at_least(*minimum) is expected
+
+
+@pytest.mark.parametrize("head_dim", [1, 7, 9, 63])
+@pytest.mark.parametrize("backend", ["flash3", "flash2"])
+def test_flash_backends_require_head_dimension_multiple_of_eight(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: backends.AttentionBackend,
+    head_dim: int,
+) -> None:
+    tensor = cast(
+        torch.Tensor,
+        SimpleNamespace(
+            device=torch.device("cuda"),
+            dtype=torch.float16,
+            shape=torch.Size((1, 2, 3, head_dim)),
+        ),
+    )
+    monkeypatch.setattr(torch.version, "cuda", "12.3")
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _device: (9, 0),
+    )
+
+    if backend == "flash3":
+        reason = backends._flash3_unavailable_reason(
+            tensor,
+            tensor,
+            tensor,
+            None,
+            None,
+            0.0,
+        )
+    else:
+        reason = backends._flash2_unavailable_reason(
+            tensor,
+            tensor,
+            tensor,
+            None,
+            None,
+        )
+
+    assert reason == "head dimensions must be a multiple of 8"
+
+
+@pytest.mark.parametrize("backend", ["flash3", "flash2"])
+def test_flash_backends_accept_aligned_head_dimension(
+    monkeypatch: pytest.MonkeyPatch,
+    backend: backends.AttentionBackend,
+) -> None:
+    tensor = cast(
+        torch.Tensor,
+        SimpleNamespace(
+            device=torch.device("cuda"),
+            dtype=torch.bfloat16,
+            shape=torch.Size((1, 2, 3, 64)),
+        ),
+    )
+    monkeypatch.setattr(torch.version, "cuda", "12.3")
+    monkeypatch.setattr(torch.version, "hip", None)
+    monkeypatch.setattr(
+        torch.cuda,
+        "get_device_capability",
+        lambda _device: (9, 0),
+    )
+
+    if backend == "flash3":
+        reason = backends._flash3_unavailable_reason(
+            tensor,
+            tensor,
+            tensor,
+            None,
+            None,
+            0.0,
+        )
+    else:
+        reason = backends._flash2_unavailable_reason(
+            tensor,
+            tensor,
+            tensor,
+            None,
+            None,
+        )
+
+    assert reason is None
 
 
 def test_auto_passes_deterministic_to_flash3(

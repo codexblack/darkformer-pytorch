@@ -181,7 +181,8 @@ def _projection_matrix(
             columns,
             generator=generator,
         )
-        orthogonal, _ = torch.linalg.qr(unstructured, mode="reduced")
+        orthogonal, upper = torch.linalg.qr(unstructured, mode="reduced")
+        orthogonal = orthogonal * torch.sign(torch.diagonal(upper))
         block_rows = min(remaining, columns)
         blocks.append(orthogonal.transpose(0, 1)[:block_rows])
         remaining -= block_rows
@@ -306,7 +307,7 @@ def _darkformer_accumulation_label(dtype: torch.dtype) -> str:
     if dtype == torch.float32:
         return "float32"
     name = str(dtype).removeprefix("torch.")
-    return f"{name} projections; float32 features and reductions"
+    return f"{name} stabilized features and reductions; float32 logits and scales"
 
 
 def _darkformer_attention(
@@ -325,6 +326,7 @@ def _darkformer_attention(
     regularization: float,
     shrinkage: float,
     geometry_scale: float,
+    causal_chunk_size: int,
 ) -> DarkformerKernelAttention:
     attention = DarkformerKernelAttention(
         query.shape[-1],
@@ -334,6 +336,7 @@ def _darkformer_attention(
         causal=causal,
         attention_mode=mode,
         exact_backend="sdpa",
+        causal_chunk_size=causal_chunk_size,
         eps=eps,
         projection_seed=seed,
         deterministic=True,
@@ -374,6 +377,7 @@ def _method(
     regularization: float,
     shrinkage: float,
     geometry_scale: float,
+    causal_chunk_size: int,
 ) -> Method:
     if name in ("sdpa-math", "sdpa-flash"):
         if name == "sdpa-flash" and not _flash_attention_available(query.device):
@@ -425,6 +429,7 @@ def _method(
         regularization=regularization,
         shrinkage=shrinkage,
         geometry_scale=geometry_scale,
+        causal_chunk_size=causal_chunk_size,
     )
     return Method(
         name,
@@ -543,6 +548,7 @@ def _error_result(
     regularization: float,
     shrinkage: float,
     geometry_scale: float,
+    causal_chunk_size: int,
 ) -> ErrorResult:
     errors: list[float] = []
     reference_name = _error_reference(method_name)
@@ -614,6 +620,7 @@ def _error_result(
                 regularization=regularization,
                 shrinkage=shrinkage,
                 geometry_scale=geometry_scale,
+                causal_chunk_size=causal_chunk_size,
             )
             with torch.inference_mode():
                 reference = exact(query, key, value)
@@ -640,6 +647,7 @@ def _error_result(
                     regularization=regularization,
                     shrinkage=shrinkage,
                     geometry_scale=geometry_scale,
+                    causal_chunk_size=causal_chunk_size,
                 )
                 with torch.inference_mode():
                     output = linear(query, key, value)
@@ -922,7 +930,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--feature-structure",
         choices=("iid", "orthogonal"),
-        default="iid",
+        default="orthogonal",
     )
     parser.add_argument(
         "--estimator-eps",
@@ -945,7 +953,8 @@ def _parser() -> argparse.ArgumentParser:
         default=1e-4,
     )
     parser.add_argument("--shrinkage", type=_nonnegative_float, default=0.01)
-    parser.add_argument("--geometry-scale", type=_positive_float, default=1.0)
+    parser.add_argument("--geometry-scale", type=_positive_float, default=None)
+    parser.add_argument("--causal-chunk-size", type=_positive_int, default=256)
     parser.add_argument(
         "--causal",
         action=argparse.BooleanOptionalAction,
@@ -970,6 +979,11 @@ def main() -> None:
     performer_accumulation = cast(
         PerformerAccumulation,
         args.performer_accumulation,
+    )
+    geometry_scale = (
+        args.head_dim**-0.25
+        if args.geometry_scale is None
+        else cast(float, args.geometry_scale)
     )
     if args.shrinkage > 1.0:
         raise ValueError("shrinkage must be in [0, 1]")
@@ -1037,7 +1051,8 @@ def main() -> None:
                     performer_accumulation=performer_accumulation,
                     regularization=args.regularization,
                     shrinkage=args.shrinkage,
-                    geometry_scale=args.geometry_scale,
+                    geometry_scale=geometry_scale,
+                    causal_chunk_size=args.causal_chunk_size,
                 )
                 result = _measure(
                     selected,
@@ -1108,7 +1123,8 @@ def main() -> None:
             performer_accumulation=performer_accumulation,
             regularization=args.regularization,
             shrinkage=args.shrinkage,
-            geometry_scale=args.geometry_scale,
+            geometry_scale=geometry_scale,
+            causal_chunk_size=args.causal_chunk_size,
         )
         for method in methods
         if method != "sdpa-math"
@@ -1119,7 +1135,7 @@ def main() -> None:
     payload = {
         "metadata": metadata,
         "config": {
-            "protocol_version": 3,
+            "protocol_version": 5,
             "methods": list(methods),
             "sequence_lengths": list(lengths),
             "batch_size": args.batch_size,
@@ -1130,11 +1146,12 @@ def main() -> None:
             "estimator_eps": args.estimator_eps,
             "performer_accumulation": performer_accumulation,
             "causal": args.causal,
+            "causal_chunk_size": args.causal_chunk_size,
             "condition_number": args.condition_number,
             "calibration_length": args.calibration_length,
             "regularization": args.regularization,
             "shrinkage": args.shrinkage,
-            "geometry_scale": args.geometry_scale,
+            "geometry_scale": geometry_scale,
             "warmup": args.warmup,
             "min_run_time": args.min_run_time,
             "timing_repeats": args.timing_repeats,

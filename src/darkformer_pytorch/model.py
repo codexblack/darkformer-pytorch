@@ -125,7 +125,7 @@ class DarkformerBlock(nn.Module):
         fixed_projection: bool | None = None,
         backend_deterministic: bool | None = None,
         per_head_geometry: bool = True,
-        orthogonal_features: bool = False,
+        orthogonal_features: bool = True,
         eps: float = 0.0,
     ) -> None:
         super().__init__()
@@ -215,7 +215,7 @@ class DarkformerBlock(nn.Module):
         context_mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
-        geometry_scale: float = 1.0,
+        geometry_scale: float | None = None,
     ) -> torch.Tensor:
         """Calibrate this block and return inputs for the next block."""
         normalized = self.self_norm(inputs)
@@ -239,6 +239,40 @@ class DarkformerBlock(nn.Module):
                 regularization=regularization,
                 shrinkage=shrinkage,
                 geometry_scale=geometry_scale,
+            )
+            inputs = inputs + self.cross_attention(
+                normalized,
+                context,
+                mask=mask,
+                context_mask=context_mask,
+            )
+        return inputs + self.feed_forward(self.feed_forward_norm(inputs))
+
+    @torch.no_grad()
+    def initialize_variance_optimal_proposal_(
+        self,
+        inputs: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Calibrate this block's feature proposals and return its output."""
+        normalized = self.self_norm(inputs)
+        self.self_attention.initialize_variance_optimal_proposal_(
+            normalized,
+            mask=mask,
+        )
+        inputs = inputs + self.self_attention(normalized, mask=mask)
+        if self.cross_attention is not None:
+            if context is None or self.cross_norm is None:
+                raise ValueError("context is required when cross_attend=True")
+            normalized = self.cross_norm(inputs)
+            self.cross_attention.initialize_variance_optimal_proposal_(
+                normalized,
+                context,
+                mask=mask,
+                context_mask=context_mask,
             )
             inputs = inputs + self.cross_attention(
                 normalized,
@@ -305,7 +339,7 @@ class Darkformer(nn.Module):
         num_features: int | None = None,
         geometry_rank: int | None = None,
         per_head_geometry: bool = True,
-        orthogonal_features: bool = False,
+        orthogonal_features: bool = True,
         mlp_dim: int | None = None,
         causal: bool = False,
         cross_attend: bool = False,
@@ -315,7 +349,7 @@ class Darkformer(nn.Module):
         dropout: float = 0.0,
         rotary: bool = True,
         rotary_base: float = 10_000.0,
-        causal_chunk_size: int = 64,
+        causal_chunk_size: int = 256,
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
         deterministic: bool = False,
@@ -412,7 +446,7 @@ class Darkformer(nn.Module):
         context_mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
-        geometry_scale: float = 1.0,
+        geometry_scale: float | None = None,
     ) -> Darkformer:
         """Calibrate every attention geometry on representative activations."""
         was_training = self.training
@@ -428,6 +462,38 @@ class Darkformer(nn.Module):
                     regularization=regularization,
                     shrinkage=shrinkage,
                     geometry_scale=geometry_scale,
+                )
+        finally:
+            self.train(was_training)
+        return self
+
+    @torch.no_grad()
+    def reset_variance_optimal_proposal_(self) -> Darkformer:
+        """Restore isotropic feature sampling in every attention layer."""
+        for attention in self._attention_modules():
+            attention.reset_variance_optimal_proposal_()
+        return self
+
+    @torch.no_grad()
+    def initialize_variance_optimal_proposal_(
+        self,
+        inputs: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
+        context: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
+    ) -> Darkformer:
+        """Calibrate every attention proposal on representative activations."""
+        was_training = self.training
+        self.eval()
+        try:
+            for module in self.layers:
+                layer = cast(DarkformerBlock, module)
+                inputs = layer.initialize_variance_optimal_proposal_(
+                    inputs,
+                    mask=mask,
+                    context=context,
+                    context_mask=context_mask,
                 )
         finally:
             self.train(was_training)
@@ -517,7 +583,7 @@ class DarkformerLM(nn.Module):
         num_features: int | None = None,
         geometry_rank: int | None = None,
         per_head_geometry: bool = True,
-        orthogonal_features: bool = False,
+        orthogonal_features: bool = True,
         mlp_dim: int | None = None,
         max_seq_len: int | None = None,
         causal: bool = True,
@@ -528,7 +594,7 @@ class DarkformerLM(nn.Module):
         tie_embeddings: bool = True,
         rotary: bool = True,
         rotary_base: float = 10_000.0,
-        causal_chunk_size: int = 64,
+        causal_chunk_size: int = 256,
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
         deterministic: bool = False,
@@ -615,7 +681,7 @@ class DarkformerLM(nn.Module):
         mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
-        geometry_scale: float = 1.0,
+        geometry_scale: float | None = None,
     ) -> DarkformerLM:
         """Calibrate all attention geometries on representative tokens."""
         self._validate_tokens(tokens, "tokens")
@@ -626,6 +692,27 @@ class DarkformerLM(nn.Module):
             shrinkage=shrinkage,
             geometry_scale=geometry_scale,
         )
+        return self
+
+    @torch.no_grad()
+    def initialize_variance_optimal_proposal_(
+        self,
+        tokens: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
+    ) -> DarkformerLM:
+        """Calibrate every attention proposal on representative tokens."""
+        self._validate_tokens(tokens, "tokens")
+        self.transformer.initialize_variance_optimal_proposal_(
+            self.token_embedding(tokens),
+            mask=mask,
+        )
+        return self
+
+    @torch.no_grad()
+    def reset_variance_optimal_proposal_(self) -> DarkformerLM:
+        """Restore isotropic feature sampling in every attention layer."""
+        self.transformer.reset_variance_optimal_proposal_()
         return self
 
     def forward_features(
@@ -789,7 +876,7 @@ class DarkformerEncDec(nn.Module):
         num_features: int | None = None,
         geometry_rank: int | None = None,
         per_head_geometry: bool = True,
-        orthogonal_features: bool = False,
+        orthogonal_features: bool = True,
         mlp_dim: int | None = None,
         max_source_length: int | None = None,
         max_target_length: int | None = None,
@@ -800,7 +887,7 @@ class DarkformerEncDec(nn.Module):
         tie_embeddings: bool = False,
         rotary: bool = True,
         rotary_base: float = 10_000.0,
-        causal_chunk_size: int = 64,
+        causal_chunk_size: int = 256,
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
         deterministic: bool = False,
@@ -934,7 +1021,7 @@ class DarkformerEncDec(nn.Module):
         target_mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
-        geometry_scale: float = 1.0,
+        geometry_scale: float | None = None,
     ) -> DarkformerEncDec:
         """Calibrate encoder and decoder geometries on representative tokens."""
         was_training = self.training
@@ -970,6 +1057,52 @@ class DarkformerEncDec(nn.Module):
             )
         finally:
             self.train(was_training)
+        return self
+
+    @torch.no_grad()
+    def initialize_variance_optimal_proposal_(
+        self,
+        source_tokens: torch.Tensor,
+        target_tokens: torch.Tensor,
+        *,
+        source_mask: torch.Tensor | None = None,
+        target_mask: torch.Tensor | None = None,
+    ) -> DarkformerEncDec:
+        """Calibrate encoder and decoder proposals on representative tokens."""
+        was_training = self.training
+        self.eval()
+        try:
+            self._validate_tokens(
+                source_tokens,
+                name="source_tokens",
+                max_length=self.max_source_length,
+            )
+            self._validate_tokens(
+                target_tokens,
+                name="target_tokens",
+                max_length=self.max_target_length,
+            )
+            source = self.source_embedding(source_tokens)
+            self.encoder.initialize_variance_optimal_proposal_(
+                source,
+                mask=source_mask,
+            )
+            context = self.encoder_norm(self.encoder(source, mask=source_mask))
+            self.decoder.initialize_variance_optimal_proposal_(
+                self.target_embedding(target_tokens),
+                mask=target_mask,
+                context=context,
+                context_mask=source_mask,
+            )
+        finally:
+            self.train(was_training)
+        return self
+
+    @torch.no_grad()
+    def reset_variance_optimal_proposal_(self) -> DarkformerEncDec:
+        """Restore isotropic feature sampling in encoder and decoder."""
+        self.encoder.reset_variance_optimal_proposal_()
+        self.decoder.reset_variance_optimal_proposal_()
         return self
 
     def unfix_projection_matrices_(self) -> DarkformerEncDec:

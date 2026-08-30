@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections.abc import Callable
 
 import torch
 from torch import nn
@@ -37,7 +38,8 @@ def _gaussian_projection(
             dtype=torch.float32,
             generator=generator,
         )
-        orthogonal_block, _ = torch.linalg.qr(unstructured, mode="reduced")
+        orthogonal_block, upper = torch.linalg.qr(unstructured, mode="reduced")
+        orthogonal_block = orthogonal_block * torch.sign(torch.diagonal(upper))
         block_rows = min(remaining, columns)
         blocks.append(orthogonal_block.transpose(0, 1)[:block_rows])
         remaining -= block_rows
@@ -76,6 +78,11 @@ class DataAwareRandomFeatures(nn.Module):
     projection_matrix: torch.Tensor
     _projection_fixed: torch.Tensor
     _projection_fixed_value: bool
+    _proposal_active: torch.Tensor
+    _proposal_active_value: bool
+    _proposal_log_weights: torch.Tensor
+    _proposal_projection: torch.Tensor
+    _proposal_root: torch.Tensor
 
     def __init__(
         self,
@@ -84,7 +91,7 @@ class DataAwareRandomFeatures(nn.Module):
         num_features: int,
         rank: int | None = None,
         per_head: bool = True,
-        orthogonal: bool = False,
+        orthogonal: bool = True,
         eps: float = 0.0,
         projection_seed: int | None = None,
         deterministic: bool = False,
@@ -139,28 +146,130 @@ class DataAwareRandomFeatures(nn.Module):
             generator=generator,
         )
         self.register_buffer("projection_matrix", projection, persistent=True)
+        proposal_heads = geometry_heads
+        proposal_root = torch.eye(rank).expand(proposal_heads, -1, -1).clone()
+        self.register_buffer("_proposal_root", proposal_root, persistent=True)
+        self._proposal_active_value = False
+        self.register_buffer(
+            "_proposal_active",
+            torch.tensor(False, dtype=torch.bool),
+            persistent=True,
+        )
+        self.register_buffer(
+            "_proposal_projection",
+            torch.empty(0, dtype=projection.dtype),
+            persistent=False,
+        )
+        self.register_buffer(
+            "_proposal_log_weights",
+            torch.empty(0, dtype=projection.dtype),
+            persistent=False,
+        )
         self._projection_fixed_value = bool(deterministic)
         self.register_buffer(
             "_projection_fixed",
             torch.tensor(self._projection_fixed_value, dtype=torch.bool),
             persistent=True,
         )
+        self.register_load_state_dict_pre_hook(  # type: ignore[no-untyped-call]
+            self._restore_missing_proposal_state
+        )
         self.register_load_state_dict_post_hook(  # type: ignore[no-untyped-call]
-            self._sync_projection_fixed
+            self._sync_runtime_state
         )
 
-    def _sync_projection_fixed(
+    def _apply(
+        self,
+        fn: Callable[[torch.Tensor], torch.Tensor],
+        recurse: bool = True,
+    ) -> DataAwareRandomFeatures:
+        super()._apply(fn, recurse=recurse)  # type: ignore[no-untyped-call]
+        # Nonpersistent derived buffers are cast by ``Module._apply`` too.
+        # Rebuilding restores float32 accumulation for low-precision modules
+        # and keeps calibration/casting order from changing feature weights.
+        self._refresh_proposal_cache()
+        return self
+
+    def _restore_missing_proposal_state(
+        self,
+        module: nn.Module,
+        state_dict: dict[str, torch.Tensor],
+        prefix: str,
+        local_metadata: object,
+        strict: bool,
+        missing_keys: list[str],
+        unexpected_keys: list[str],
+        error_messages: list[str],
+    ) -> None:
+        del (
+            module,
+            local_metadata,
+            strict,
+            missing_keys,
+            unexpected_keys,
+            error_messages,
+        )
+        root_key = f"{prefix}_proposal_root"
+        active_key = f"{prefix}_proposal_active"
+        if root_key not in state_dict:
+            identity = torch.eye(
+                self.rank,
+                device=self._proposal_root.device,
+                dtype=self._proposal_root.dtype,
+            )
+            state_dict[root_key] = identity.expand_as(self._proposal_root).clone()
+        if active_key not in state_dict:
+            state_dict[active_key] = torch.zeros_like(self._proposal_active)
+
+    def _sync_runtime_state(
         self,
         module: nn.Module,
         incompatible_keys: object,
     ) -> None:
         del module, incompatible_keys
         self._projection_fixed_value = bool(self._projection_fixed.item())
+        self._proposal_active_value = bool(self._proposal_active.item())
+        self._refresh_proposal_cache()
 
     @property
     def projection_is_fixed(self) -> bool:
         """Whether ordinary redraw requests are disabled."""
         return self._projection_fixed_value
+
+    @property
+    def proposal_is_active(self) -> bool:
+        """Whether projections use a separate importance-sampling proposal."""
+        return self._proposal_active_value
+
+    @torch.no_grad()
+    def _refresh_proposal_cache(self) -> None:
+        if not self.proposal_is_active:
+            self._proposal_projection = self.projection_matrix.new_empty(0)
+            self._proposal_log_weights = self.projection_matrix.new_empty(0)
+            return
+
+        proposal_projection = torch.matmul(
+            self.projection_matrix.unsqueeze(0),
+            self._proposal_root.transpose(-1, -2),
+        )
+        accumulation_dtype = (
+            torch.float32
+            if proposal_projection.dtype in (torch.float16, torch.bfloat16)
+            else proposal_projection.dtype
+        )
+        base_projection = self.projection_matrix.to(accumulation_dtype)
+        proposal_projection_accumulated = proposal_projection.to(accumulation_dtype)
+        root = self._proposal_root.to(accumulation_dtype)
+        sign, root_log_determinant = torch.linalg.slogdet(root)
+        if bool((sign <= 0.0).any()):
+            raise RuntimeError("proposal root must have positive determinant")
+        log_weights = 0.5 * root_log_determinant[:, None]
+        log_weights = log_weights + 0.25 * (
+            base_projection.square().sum(dim=-1)[None, :]
+            - proposal_projection_accumulated.square().sum(dim=-1)
+        )
+        self._proposal_projection = proposal_projection
+        self._proposal_log_weights = log_weights
 
     @torch.no_grad()
     def redraw_projection_(
@@ -189,6 +298,7 @@ class DataAwareRandomFeatures(nn.Module):
                 dtype=self.projection_matrix.dtype,
             )
         )
+        self._refresh_proposal_cache()
         return self
 
     @torch.no_grad()
@@ -212,6 +322,27 @@ class DataAwareRandomFeatures(nn.Module):
             covariance = covariance.expand(self.num_heads, -1, -1)
         return covariance
 
+    def proposal_covariance(self) -> torch.Tensor:
+        """Return the projection proposal covariance for every head."""
+        covariance = self._proposal_root @ self._proposal_root.transpose(-1, -2)
+        if not self.per_head:
+            covariance = covariance.expand(self.num_heads, -1, -1)
+        return covariance
+
+    @torch.no_grad()
+    def reset_variance_optimal_proposal_(self) -> DataAwareRandomFeatures:
+        """Reset projection sampling to the standard isotropic distribution."""
+        identity = torch.eye(
+            self.rank,
+            device=self._proposal_root.device,
+            dtype=self._proposal_root.dtype,
+        )
+        self._proposal_root.copy_(identity.expand_as(self._proposal_root))
+        self._proposal_active.fill_(False)
+        self._proposal_active_value = False
+        self._refresh_proposal_cache()
+        return self
+
     def _validate_calibration_mask(
         self,
         name: str,
@@ -234,8 +365,18 @@ class DataAwareRandomFeatures(nn.Module):
         mask: torch.Tensor | None,
         *,
         shared: bool,
+        expected_dimension: int | None = None,
     ) -> tuple[torch.Tensor, int]:
-        self._validate_data(data)
+        expected_dimension = (
+            self.head_dim if expected_dimension is None else expected_dimension
+        )
+        if data.ndim != 4:
+            raise ValueError("data must have shape [batch, heads, length, dimension]")
+        if data.shape[1] != self.num_heads or data.shape[-1] != expected_dimension:
+            raise ValueError(
+                f"data must have {self.num_heads} heads and dimension "
+                f"{expected_dimension}"
+            )
         if data.device != self.geometry.device:
             raise ValueError("calibration data must share the geometry device")
         accumulation_dtype = (
@@ -277,6 +418,115 @@ class DataAwareRandomFeatures(nn.Module):
         return covariance, count - 1
 
     @torch.no_grad()
+    def initialize_variance_optimal_proposal_(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        *,
+        query_mask: torch.Tensor | None = None,
+        key_mask: torch.Tensor | None = None,
+    ) -> DataAwareRandomFeatures:
+        """Initialize the separate proposal from Theorem 3.2.
+
+        The covariance is estimated after applying the feature map's
+        ``head_dim**-0.25`` scaling and the current learned geometry. For a
+        common centered Gaussian transformed input covariance ``Lambda``,
+        projection vectors are then sampled from the variance-optimal proposal
+        ``(I + 2 Lambda) @ inv(I - 2 Lambda)``. Each positive feature receives
+        the square root of the exact ``p_I / p_proposal`` density ratio, so
+        changing the proposal does not change the kernel being estimated.
+        For unequal or non-Gaussian query/key distributions, the pooled
+        moment-matched proposal remains unbiased but is not guaranteed to be
+        variance-optimal. Orthogonal features likewise preserve the corrected
+        marginal expectation, while the theorem's IID variance claim does not
+        cover their inter-row dependence.
+
+        Args:
+          query: Projected queries with shape `[batch, heads, length, head_dim]`.
+          key: Optional projected keys. When omitted, only queries are used.
+          query_mask: Valid query positions with shape `[batch, length]`.
+          key_mask: Valid key positions with shape `[batch, key_length]`.
+
+        Returns:
+          This module.
+
+        Raises:
+          ValueError: Inputs are invalid or the transformed covariance has an
+            eigenvalue at least ``0.5``.
+        """
+        self._validate_data(query)
+        if query.device != self.geometry.device:
+            raise ValueError("calibration data must share the geometry device")
+        self._validate_calibration_mask("query_mask", query_mask, query)
+        accumulation_dtype = (
+            torch.float64 if query.dtype == torch.float64 else torch.float32
+        )
+        geometry = self._geometry_for_heads().to(accumulation_dtype)
+        normalizer = self.head_dim**-0.25
+        transformed_query = torch.matmul(
+            query.to(accumulation_dtype) * normalizer,
+            geometry.transpose(-1, -2),
+        )
+        query_covariance, query_degrees = self._empirical_covariance(
+            transformed_query,
+            query_mask,
+            shared=not self.per_head,
+            expected_dimension=self.rank,
+        )
+        covariance = query_covariance
+        degrees = query_degrees
+        if key is not None:
+            if key.device != query.device or key.dtype != query.dtype:
+                raise ValueError("query and key must share a device and dtype")
+            self._validate_data(key)
+            self._validate_calibration_mask("key_mask", key_mask, key)
+            transformed_key = torch.matmul(
+                key.to(accumulation_dtype) * normalizer,
+                geometry.transpose(-1, -2),
+            )
+            key_covariance, key_degrees = self._empirical_covariance(
+                transformed_key,
+                key_mask,
+                shared=not self.per_head,
+                expected_dimension=self.rank,
+            )
+            degrees += key_degrees
+            covariance = (
+                query_covariance * query_degrees + key_covariance * key_degrees
+            ) / degrees
+        elif key_mask is not None:
+            raise ValueError("key_mask requires key calibration data")
+
+        covariance = 0.5 * (covariance + covariance.transpose(-1, -2))
+        eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+        tolerance = (
+            torch.finfo(eigenvalues.dtype).eps
+            * self.rank
+            * covariance.abs().amax().clamp_min(1.0)
+        )
+        if bool((eigenvalues < -tolerance).any()):
+            raise ValueError(
+                "transformed empirical covariance is not positive semidefinite"
+            )
+        eigenvalues = eigenvalues.clamp_min(0.0)
+        if bool((eigenvalues >= 0.5).any()):
+            raise ValueError(
+                "variance-optimal proposal requires every transformed covariance "
+                "eigenvalue to be below 0.5; reduce the geometry scale"
+            )
+        proposal_eigenvalues = (1.0 + 2.0 * eigenvalues) / (1.0 - 2.0 * eigenvalues)
+        proposal_root = (
+            eigenvectors
+            @ torch.diag_embed(proposal_eigenvalues.sqrt())
+            @ eigenvectors.transpose(-1, -2)
+        )
+        self._proposal_root.copy_(proposal_root.to(self._proposal_root))
+        self._proposal_active.fill_(True)
+        self._proposal_active_value = True
+        self._refresh_proposal_cache()
+        return self
+
+    @torch.no_grad()
     def initialize_whitening_(
         self,
         query: torch.Tensor,
@@ -286,7 +536,7 @@ class DataAwareRandomFeatures(nn.Module):
         key_mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
-        geometry_scale: float = 1.0,
+        geometry_scale: float | None = None,
     ) -> DataAwareRandomFeatures:
         """Initialize geometry from empirical query and key covariance.
 
@@ -302,7 +552,10 @@ class DataAwareRandomFeatures(nn.Module):
           regularization: Nonnegative diagonal loading relative to mean variance.
           shrinkage: Weight assigned to an isotropic covariance target.
           geometry_scale: Positive scale applied after inverse-covariance
-            whitening. The default ``1.0`` performs literal whitening.
+            whitening. Defaults to ``head_dim**-0.25``. At this low-level API,
+            inputs are whitened exactly as passed; use kernel-scaled calibration
+            tensors to reproduce the high-level temperature-preserving policy.
+            Pass ``1.0`` for literal whitening.
 
         Returns:
           This module.
@@ -316,12 +569,19 @@ class DataAwareRandomFeatures(nn.Module):
         """
         if self.rank != self.head_dim:
             raise ValueError("whitening initialization requires full-rank geometry")
+        default_geometry_scale = self.head_dim**-0.25
+        using_default_scale = geometry_scale is None
+        if geometry_scale is None:
+            geometry_scale = default_geometry_scale
         if regularization < 0.0 or not math.isfinite(regularization):
             raise ValueError("regularization must be finite and nonnegative")
         if not 0.0 <= shrinkage <= 1.0 or not math.isfinite(shrinkage):
             raise ValueError("shrinkage must be finite and in [0, 1]")
         if geometry_scale <= 0.0 or not math.isfinite(geometry_scale):
             raise ValueError("geometry_scale must be finite and positive")
+        using_default_scale = (
+            using_default_scale or geometry_scale == default_geometry_scale
+        )
         self._validate_calibration_mask("query_mask", query_mask, query)
         query_covariance, query_degrees = self._empirical_covariance(
             query,
@@ -371,7 +631,9 @@ class DataAwareRandomFeatures(nn.Module):
             @ eigenvectors.transpose(-1, -2)
         )
         expected_squared_norm = self.head_dim * geometry_scale**2
-        if geometry_scale == 1.0:
+        if using_default_scale:
+            warning = None
+        elif geometry_scale == 1.0:
             warning = (
                 "literal whitening targets unit transformed covariance, so the "
                 f"expected squared feature input norm is approximately head_dim="
@@ -389,7 +651,8 @@ class DataAwareRandomFeatures(nn.Module):
                 f"{expected_squared_norm:g}; this scale changes both attention "
                 "temperature and positive random-feature variance"
             )
-        warnings.warn(warning, UserWarning, stacklevel=3)
+        if warning is not None:
+            warnings.warn(warning, UserWarning, stacklevel=3)
         self.geometry.copy_((geometry_scale * inverse_root).to(self.geometry))
         return self
 
@@ -451,10 +714,30 @@ class DataAwareRandomFeatures(nn.Module):
             scaled_data,
             self._geometry_for_heads().transpose(-1, -2),
         )
-        projected = torch.matmul(
-            transformed,
-            self.projection_matrix.transpose(0, 1),
-        )
+        proposal_log_weights = None
+        if self.proposal_is_active:
+            proposal_projection = self._proposal_projection
+            proposal_log_weights = self._proposal_log_weights
+            if not self.per_head:
+                proposal_projection = proposal_projection.expand(
+                    self.num_heads,
+                    -1,
+                    -1,
+                )
+                proposal_log_weights = proposal_log_weights.expand(
+                    self.num_heads,
+                    -1,
+                )
+            projected = torch.einsum(
+                "bhld,hmd->bhlm",
+                transformed,
+                proposal_projection,
+            )
+        else:
+            projected = torch.matmul(
+                transformed,
+                self.projection_matrix.transpose(0, 1),
+            )
         accumulation_dtype = (
             torch.float32
             if projected.dtype in (torch.float16, torch.bfloat16)
@@ -462,10 +745,15 @@ class DataAwareRandomFeatures(nn.Module):
         )
         projected = projected.to(accumulation_dtype)
         transformed = transformed.to(accumulation_dtype)
-        return projected - 0.5 * transformed.square().sum(
+        logits = projected - 0.5 * transformed.square().sum(
             dim=-1,
             keepdim=True,
         )
+        if proposal_log_weights is not None:
+            return logits + proposal_log_weights[None, :, None, :].to(
+                accumulation_dtype
+            )
+        return logits
 
     def _feature_map(
         self,
@@ -494,9 +782,16 @@ class DataAwareRandomFeatures(nn.Module):
             # positive floor it could make eps * exp(-maximum) overflow.
             if self.eps > 0.0:
                 maximum = maximum.clamp_min(0.0)
-            features = torch.exp(logits - maximum)
+            stabilized_logits = logits - maximum
+            if data.dtype in (torch.float16, torch.bfloat16):
+                # Compute the norm correction and stabilizing maximum in fp32,
+                # but keep the feature-sized exponential in the model dtype.
+                # Its argument is nonpositive, so this cannot introduce the
+                # low-precision overflow that the fp32 logit path prevents.
+                stabilized_logits = stabilized_logits.to(data.dtype)
+            features = torch.exp(stabilized_logits)
             if self.eps > 0.0:
-                features = features + self.eps * torch.exp(-maximum)
+                features = features + self.eps * torch.exp(-maximum.to(features.dtype))
         else:
             features = torch.exp(logits) + self.eps
         features = features * self.num_features**-0.5

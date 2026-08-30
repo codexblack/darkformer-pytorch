@@ -6,14 +6,20 @@ import math
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager, nullcontext
 from functools import lru_cache
+from importlib import import_module
 from typing import Literal, cast
 
 import torch
 from torch.nn import functional
 
 AttentionBackend = Literal["auto", "flash3", "flash2", "sdpa"]
-_FlashAttention = Callable[..., torch.Tensor]
+_Flash3Attention = Callable[
+    ...,
+    torch.Tensor | tuple[torch.Tensor, ...],
+]
+_Flash2Attention = Callable[..., torch.Tensor]
 _FLASH_DTYPES = (torch.float16, torch.bfloat16)
+_FLASH_HEAD_DIM_ALIGNMENT = 8
 
 
 def _cuda_version_at_least(major: int, minor: int) -> bool:
@@ -28,21 +34,30 @@ def _cuda_version_at_least(major: int, minor: int) -> bool:
 
 
 @lru_cache(maxsize=1)
-def _load_flash3() -> tuple[_FlashAttention | None, Exception | None]:
-    try:
-        from flash_attn_3 import flash_attn_interface
-    except (ImportError, OSError) as error:
-        return None, error
-    return cast(_FlashAttention, flash_attn_interface.flash_attn_func), None
+def _load_flash3() -> tuple[_Flash3Attention | None, Exception | None]:
+    first_error: Exception | None = None
+    for module_name in (
+        "flash_attn_3.flash_attn_interface",
+        "flash_attn_interface",
+    ):
+        try:
+            interface = import_module(module_name)
+            function = interface.flash_attn_func
+        except (AttributeError, ImportError, OSError) as error:
+            if first_error is None:
+                first_error = error
+            continue
+        return cast(_Flash3Attention, function), None
+    return None, first_error
 
 
 @lru_cache(maxsize=1)
-def _load_flash2() -> tuple[_FlashAttention | None, Exception | None]:
+def _load_flash2() -> tuple[_Flash2Attention | None, Exception | None]:
     try:
         from flash_attn import flash_attn_func
     except (ImportError, OSError) as error:
         return None, error
-    return cast(_FlashAttention, flash_attn_func), None
+    return cast(_Flash2Attention, flash_attn_func), None
 
 
 def _flash3_unavailable_reason(
@@ -71,6 +86,8 @@ def _flash3_unavailable_reason(
         return "query, key, and value head dimensions must match"
     if query.shape[-1] > 256:
         return "head dimensions greater than 256 are unsupported"
+    if query.shape[-1] % _FLASH_HEAD_DIM_ALIGNMENT != 0:
+        return "head dimensions must be a multiple of 8"
     return None
 
 
@@ -97,6 +114,8 @@ def _flash2_unavailable_reason(
         return "query, key, and value head dimensions must match"
     if query.shape[-1] > 256:
         return "head dimensions greater than 256 are unsupported"
+    if query.shape[-1] % _FLASH_HEAD_DIM_ALIGNMENT != 0:
+        return "head dimensions must be a multiple of 8"
     if key_mask is not None:
         return "padding masks are unsupported"
     return None
@@ -167,7 +186,7 @@ def _validate_inputs(
 
 
 def _run_flash3(
-    function: _FlashAttention,
+    function: _Flash3Attention,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -175,7 +194,7 @@ def _run_flash3(
     scale: float,
     deterministic: bool,
 ) -> torch.Tensor:
-    output = function(
+    result = function(
         query.transpose(1, 2),
         key.transpose(1, 2),
         value.transpose(1, 2),
@@ -183,11 +202,12 @@ def _run_flash3(
         causal=causal,
         deterministic=deterministic,
     )
+    output = result[0] if isinstance(result, tuple) else result
     return output.transpose(1, 2)
 
 
 def _run_flash2(
-    function: _FlashAttention,
+    function: _Flash2Attention,
     query: torch.Tensor,
     key: torch.Tensor,
     value: torch.Tensor,
@@ -326,7 +346,8 @@ def exact_attention(
       query_mask: Boolean tensor with shape `[batch, query_length]`; true values
         are valid.
       key_mask: Boolean tensor with shape `[batch, key_length]`; true values are
-        valid.
+        valid. Pass `None`, rather than an all-true tensor, when no keys are
+        masked so automatic backend selection can use maskless FlashAttention.
       dropout_p: Attention dropout probability.
       backend: Attention implementation to use.
       scale: Scale applied to query-key scores.
@@ -353,9 +374,9 @@ def exact_attention(
         backend,
         scale,
     )
+    # FlashAttention does not accept padding masks. Treat `None` as the explicit
+    # all-valid signal so dispatch never has to reduce device mask contents.
     dispatch_key_mask = key_mask
-    if key_mask is not None and bool(key_mask.all()):
-        dispatch_key_mask = None
 
     if backend in ("auto", "flash3"):
         flash3_reason = _flash3_unavailable_reason(

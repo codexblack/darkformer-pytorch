@@ -7,8 +7,9 @@ import pytest
 import torch
 from torch import nn
 
-from darkformer_pytorch.attention import AttentionMode
+from darkformer_pytorch.attention import AttentionMode, DarkformerKernelAttention
 from darkformer_pytorch.model import (
+    Darkformer,
     DarkformerBlock,
     DarkformerEncDec,
     DarkformerLM,
@@ -487,13 +488,65 @@ def test_encoder_decoder_projection_controls_reach_all_attention() -> None:
     _assert_projection_controls(model, expected_modules=3)
 
 
-def test_model_defaults_use_paper_feature_estimator() -> None:
-    """Model constructors propagate IID features and a zero feature floor."""
+def test_model_defaults_use_variance_reduced_feature_estimator() -> None:
+    """Model constructors propagate orthogonal features and a zero feature floor."""
     model = _language_model(depth=2)
 
     for random_features in _random_feature_modules(model):
-        assert not random_features.orthogonal
+        assert random_features.orthogonal
         assert random_features.eps == 0.0
+
+
+def test_fixing_projection_subset_cannot_collide_redraw_seed_streams() -> None:
+    """Unequal redraw counters do not alias another layer's projection seed."""
+    model = Darkformer(
+        dim=4,
+        depth=2,
+        heads=1,
+        head_dim=4,
+        num_features=8,
+        rotary=False,
+        projection_seed=7,
+    )
+    attention_modules = list(model._attention_modules())
+    first = attention_modules[0].attention
+    second = attention_modules[1].attention
+    second.fix_projection_matrices_()
+
+    model.redraw_projection_matrices_()
+    model.redraw_projection_matrices_()
+
+    assert first._redraw_count.item() == 2
+    assert second._redraw_count.item() == 0
+    assert not torch.equal(
+        first.random_features.projection_matrix,
+        second.random_features.projection_matrix,
+    )
+
+
+def test_public_models_default_to_256_token_causal_chunks() -> None:
+    """Every public model propagates the causal chunk default to its attention."""
+    models = (
+        Darkformer(dim=4, depth=1, heads=1, rotary=False),
+        DarkformerLM(vocab_size=5, dim=4, depth=1, heads=1, rotary=False),
+        DarkformerEncDec(
+            source_vocab_size=5,
+            target_vocab_size=5,
+            dim=4,
+            depth=1,
+            heads=1,
+            rotary=False,
+        ),
+    )
+
+    for model in models:
+        attention_modules = [
+            module
+            for module in model.modules()
+            if isinstance(module, DarkformerKernelAttention)
+        ]
+        assert attention_modules
+        assert all(module.causal_chunk_size == 256 for module in attention_modules)
 
 
 def test_model_propagates_independent_determinism_policies() -> None:
@@ -527,6 +580,47 @@ def test_language_model_whitening_calibrates_all_layers() -> None:
     assert model.training
     for module, original in zip(modules, initial, strict=True):
         assert not torch.equal(module.geometry, original)
+
+
+def test_language_model_calibrates_variance_optimal_proposals() -> None:
+    """Representative tokens initialize every language-model proposal."""
+    model = _language_model(depth=2, max_seq_len=8)
+    tokens = torch.randint(0, model.vocab_size, (4, 8))
+    modules = _random_feature_modules(model)
+    with torch.no_grad():
+        for module in modules:
+            module.geometry.mul_(0.1)
+
+    model.initialize_variance_optimal_proposal_(tokens)
+
+    assert model.training
+    assert all(module.proposal_is_active for module in modules)
+
+    returned = model.reset_variance_optimal_proposal_()
+
+    assert returned is model
+    assert all(not module.proposal_is_active for module in modules)
+
+
+def test_encoder_decoder_calibrates_variance_optimal_proposals() -> None:
+    """Representative source and target tokens initialize all proposals."""
+    model = _encoder_decoder()
+    source_tokens = torch.randint(0, model.source_vocab_size, (4, 8))
+    target_tokens = torch.randint(0, model.target_vocab_size, (4, 8))
+    modules = _random_feature_modules(model)
+    with torch.no_grad():
+        for module in modules:
+            module.geometry.mul_(0.1)
+
+    model.initialize_variance_optimal_proposal_(source_tokens, target_tokens)
+
+    assert model.training
+    assert all(module.proposal_is_active for module in modules)
+
+    returned = model.reset_variance_optimal_proposal_()
+
+    assert returned is model
+    assert all(not module.proposal_is_active for module in modules)
 
 
 def test_encoder_decoder_whitening_uses_normalized_context() -> None:

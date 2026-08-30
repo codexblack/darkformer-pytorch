@@ -120,10 +120,19 @@ output = attention(x, mask=mask)
 
 The input and output shapes are $B \times L \times d$. A boolean `mask` has shape
 $B \times L$, where `True` marks a valid token. Causal attention combines the token
-mask with the causal constraint.
+mask with the causal constraint. Causal linear attention processes 256 tokens per
+chunk by default; tune `causal_chunk_size` for the target device when throughput or
+temporary-memory use matters.
 
-Independent Gaussian features are the default, matching Equation (3). Set
-`orthogonal_features=True` to use Performer-style orthogonal Gaussian blocks.
+Performer-style orthogonal Gaussian blocks are the default because they preserve
+the Gaussian row marginals while reducing finite-feature variance. They add QR
+work when projection matrices are constructed or redrawn. Set
+`orthogonal_features=False` to use independent Equation (3) draws instead.
+The automatic `num_features = d * ln(d)` count is a compute heuristic, not an
+accuracy guarantee: Monte Carlo error falls only as $O(m^{-1/2})$. Benchmark the
+approximation on the target workload and increase `num_features` when accuracy is
+more important than the default compute budget.
+
 The additive feature floor is disabled by default. Linear attention treats a
 normalization mass at or below `torch.finfo(dtype).tiny` as an underflowed row and
 returns a zero output with zero gradients, preventing a finite forward pass from
@@ -162,8 +171,9 @@ M=s\Lambda^{-1/2},\qquad
 
 Here $q$ and $k$ denote the scaled kernel inputs. If their empirical covariances
 differ, the pooled estimate is a symmetric compromise and does not whiten both
-distributions exactly. Pass $s$ as `geometry_scale`. The default remains `1.0`
-for backward compatibility and literal Proposition C.1 whitening.
+distributions exactly. Pass $s$ as `geometry_scale`. By default,
+$s=d_h^{-1/4}$, which preserves the usual $1/\sqrt{d_h}$ score temperature.
+Pass `geometry_scale=1.0` explicitly for literal Proposition C.1 whitening.
 
 For raw projected queries with covariance $\Lambda_0$, unregularized calibration
 sets
@@ -179,22 +189,36 @@ is approximately $d_hs^2$. Useful scale policies are:
 | Policy | `geometry_scale` | Expected $\lVert Mq\rVert^2$ | Effect |
 | :--- | :--- | :--- | :--- |
 | Literal Proposition C.1 | `1.0` | $d_h$ | Unit covariance; highest dynamic range |
-| Temperature preserving | `head_dim**-0.25` | $\sqrt{d_h}$ | Restores the usual $1/\sqrt{d_h}$ Mahalanobis score scale |
+| Temperature preserving (default) | `head_dim**-0.25` | $\sqrt{d_h}$ | Restores the usual $1/\sqrt{d_h}$ Mahalanobis score scale |
 | Unit expected norm | `head_dim**-0.5` | $1$ | Lower feature variance, but colder attention |
 
 The variance of exponential random features grows rapidly with the transformed
 norm, so literal whitening can be impractical at ordinary head dimensions.
-`initialize_whitening_` emits a warning reporting the selected scale and expected
-norm. Covariance `shrinkage` is different: it regularizes the estimated covariance
-toward an isotropic shape but does not uniformly reduce $M$.
+Explicit nondefault scales emit a warning reporting the selected scale and
+expected norm. Covariance `shrinkage` is different: it regularizes the estimated
+covariance toward an isotropic shape but does not uniformly reduce $M$.
+`regularization` is then applied as additive diagonal loading, so the combined
+shrinkage-and-loading expression is intentionally not a convex combination.
 
 Proposition C.1's whitening geometry is also distinct from Theorem 3.2's
 variance-optimal proposal
-$\Sigma^*=(I+2\Lambda)(I-2\Lambda)^{-1}$. DARKformer couples kernel geometry and
-sampling covariance through the same learned matrix, so `initialize_whitening_`
-does not implement that separate proposal. `geometry_scale` rescales the coupled
-geometry; it is not a substitute for $\Sigma^*$. Validate any calibrated geometry
-with the feature count and data distribution used in training.
+$\Sigma^*=(I+2\Lambda)(I-2\Lambda)^{-1}$. The library implements this as a genuinely
+separate proposal: `initialize_variance_optimal_proposal_` estimates $\Lambda$
+after the current kernel transform, samples each head's projections from $\Sigma^*$,
+and splits the exact isotropic-to-proposal density ratio across the query and key
+feature maps. The target kernel remains unchanged and the estimator remains unbiased.
+The initializer raises if an eigenvalue of $\Lambda$ is at least $1/2$, where the
+closed form is not normalizable. Calibrate the proposal after setting the final
+geometry; later geometry training preserves unbiasedness but can make the fixed
+proposal no longer variance-optimal.
+
+The theorem's variance-optimality claim assumes queries and keys share a zero-mean
+Gaussian law. With unequal or non-Gaussian calibration distributions, the pooled
+moment-matched proposal remains an unbiased importance proposal but is only a
+variance heuristic. Orthogonal projection rows also preserve unbiasedness after
+the QR sign correction, although the theorem's IID variance claim does not cover
+their inter-row dependence. Call `reset_variance_optimal_proposal_()` to restore
+isotropic sampling; high-level resets also invalidate recurrent/context states.
 
 ```python
 import torch
@@ -222,8 +246,9 @@ model.initialize_whitening_(
     calibration_tokens,
     regularization=1e-4,
     shrinkage=0.01,
-    geometry_scale=64**-0.25,
 )
+
+model.initialize_variance_optimal_proposal_(calibration_tokens)
 ```
 
 `SelfAttention.initialize_whitening_(inputs, mask=...)` and
@@ -232,12 +257,17 @@ calibration for standalone modules. `DarkformerKernelAttention` accepts already
 projected, unscaled tensors with shape $B \times H \times L \times d_h$ and applies
 the kernel scaling internally. `DataAwareRandomFeatures.initialize_whitening_`
 instead whitens the tensors passed directly to it without applying attention
-scaling.
+scaling. Low-level callers should therefore pass
+`calibration * head_dim**-0.25` to reproduce the high-level policy. The
+corresponding `initialize_variance_optimal_proposal_` and
+`reset_variance_optimal_proposal_` methods are available at every level of the API.
 
 Full-rank geometry is required for whitening and for the density-ratio argument in
 Proposition 4.1. Setting `geometry_rank < head_dim` produces a singular covariance;
 the kernel estimator remains valid, but the full-density importance-sampling
 interpretation does not. Construction emits a warning for that configuration.
+Theorem 3.2's proposal still operates in the configured rank-dimensional
+feature space, including for low-rank geometry.
 Full configured rank is necessary but does not guarantee $\Sigma \succ 0$ throughout
 training because $M$ is unconstrained and can become singular. Set
 `per_head_geometry=False` to estimate one covariance shared by every head. The
@@ -258,7 +288,12 @@ Exact and linear modes compute materially different functions at finite feature
 counts. Consequently, `"auto"` is an explicit accuracy/performance policy, not a
 backend-only optimization: output can change discontinuously when a sequence
 crosses the cutoff. `exact_threshold` is required with `attention_mode="auto"` and
-is independent of `num_features`.
+is independent of `num_features`. The condition `num_features < sequence_length`
+is necessary but not sufficient for a speedup: kernel constants and the exact
+backend move the crossover substantially. In a CPU sweep at `head_dim=64` with
+the default 266 features, exact attention was still faster at length 4096. Treat
+4096 as a lower-bound starting point for that configuration and benchmark the
+target hardware; fused GPU exact attention can move the crossover later.
 
 Provide the cutoff explicitly:
 
@@ -278,7 +313,12 @@ FlashAttention 2, when an installed backend supports the device, dtype, head
 dimension, dropout, causality, and mask. It otherwise uses PyTorch scaled dot-product
 attention. Set `exact_backend` to `"flash3"`, `"flash2"`, or `"sdpa"` to request a
 specific backend. A forced FlashAttention backend raises an error when its package or
-required hardware support is unavailable.
+required hardware support is unavailable. Flash dispatch requires transformed query,
+key, and value head dimensions to match, be at most 256, and be divisible by 8;
+low-rank `geometry_rank` settings that do not satisfy those constraints fall back to
+SDPA. Any non-`None` key mask is treated as a real padding mask and uses mask-capable
+SDPA without inspecting mask values on the host. Pass `None`, rather than an
+all-`True` tensor, when every key is valid and FlashAttention dispatch is desired.
 
 FlashAttention 3 requires an NVIDIA Hopper GPU and CUDA 12.3 or newer.
 FlashAttention 2 requires CUDA 12.0 or newer on supported NVIDIA GPUs, or a
@@ -341,7 +381,9 @@ attention.unfix_projection_matrices_()
 
 Fixed projections ignore ordinary manual and scheduled redraws. Pass `force=True`
 for an intentional one-time redraw while fixed. `projection_seed` makes initial
-projections reproducible independently of PyTorch's global random state. Use
+projections reproducible independently of PyTorch's global random state. Redraw
+seeds combine that per-module seed with its persistent redraw counter, so fixing
+only a subset of layers cannot make another layer reuse its projection stream. Use
 `fixed_projection=True` to fix projection matrices at construction, and use
 `backend_deterministic=True` to request deterministic exact-backend behavior from
 FlashAttention 2 or 3 and the SDPA math fallback. These controls are independent.
@@ -377,8 +419,11 @@ with torch.autocast("cuda", dtype=torch.bfloat16):
 ```
 
 We generally prefer `bfloat16` where supported because of its wider exponent
-range. Numerically sensitive feature normalization and reductions use stable
-accumulation before results are returned in the model dtype.
+range. Feature logits and stabilization scales remain in float32, while bounded
+stabilized exponentials, feature activations, reductions, and recurrent sums use
+the model dtype instead of silently doubling activation memory. Unstabilized
+`stabilize=False` feature maps remain float32 because their raw exponentials are
+unbounded.
 
 ## Transformer stacks
 
@@ -536,13 +581,14 @@ anisotropic tensors. It measures kernel execution and does not reproduce the
 paper's model finetuning experiments.
 
 Performer and DARKformer use the same feature count, IID or orthogonal feature
-structure, projection seeds, and additive feature floor. Performer projections
-are injected explicitly instead of using its constructor defaults. DARKformer is
-whitened from a separate calibration sample using the configurable
-`--geometry-scale` (literal `1.0` by default), and calibration is excluded from
-timed regions. Performance rows report the median and IQR across repeated blocked
-timings. GPU memory is the incremental peak allocation during one warmed forward,
-not total process or model memory.
+structure (orthogonal by default), projection seeds, and additive feature floor.
+Performer projections are injected explicitly instead of using its constructor
+defaults. DARKformer is whitened from a separate calibration sample using the
+configurable `--geometry-scale` (temperature-preserving `head_dim**-0.25` by
+default). Calibration is excluded from timed regions. Causal runs record and accept
+`--causal-chunk-size` (256 by default). Performance rows report the median and IQR
+across repeated blocked timings. GPU memory is the incremental peak allocation
+during one warmed forward, not total process or model memory.
 
 Approximation error is measured in float32 over 30 projection seeds by default.
 Performer is compared with isotropic SDPA math. DARKformer is compared with exact

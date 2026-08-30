@@ -40,6 +40,15 @@ def _feature_count(head_dim: int) -> int:
     return max(1, int(head_dim * math.log(max(head_dim, 2))))
 
 
+def _redraw_stream_seed(base_seed: int, redraw_count: int) -> int:
+    """Derive independent deterministic seeds for successive projection draws."""
+    mask = (1 << 64) - 1
+    value = (base_seed + redraw_count * 0x9E3779B97F4A7C15) & mask
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & mask
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & mask
+    return (value ^ (value >> 31)) & ((1 << 63) - 1)
+
+
 def _validate_mask(
     mask: torch.Tensor | None,
     *,
@@ -205,12 +214,12 @@ class DarkformerKernelAttention(nn.Module):
         num_features: int | None = None,
         geometry_rank: int | None = None,
         per_head_geometry: bool = True,
-        orthogonal_features: bool = False,
+        orthogonal_features: bool = True,
         causal: bool = False,
         attention_mode: AttentionMode = "linear",
         exact_threshold: int | None = None,
         exact_backend: AttentionBackend = "auto",
-        causal_chunk_size: int = 64,
+        causal_chunk_size: int = 256,
         eps: float = 0.0,
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
@@ -227,9 +236,7 @@ class DarkformerKernelAttention(nn.Module):
         if eps > 0.0 and attention_mode != "linear":
             raise ValueError("eps must be zero unless attention_mode='linear'")
         if attention_mode == "auto" and exact_threshold is None:
-            raise ValueError(
-                "exact_threshold is required when attention_mode='auto'"
-            )
+            raise ValueError("exact_threshold is required when attention_mode='auto'")
         if exact_threshold is not None and exact_threshold < 1:
             raise ValueError("exact_threshold must be positive")
         if causal_chunk_size < 1:
@@ -341,6 +348,11 @@ class DarkformerKernelAttention(nn.Module):
         """Return the attention covariance for every head."""
         return self.random_features.covariance()
 
+    def proposal_covariance(self) -> torch.Tensor:
+        """Return the feature proposal covariance for every head."""
+        return self.random_features.proposal_covariance()
+
+    @torch.no_grad()
     def initialize_whitening_(
         self,
         query: torch.Tensor,
@@ -350,7 +362,7 @@ class DarkformerKernelAttention(nn.Module):
         key_mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
-        geometry_scale: float = 1.0,
+        geometry_scale: float | None = None,
     ) -> DarkformerKernelAttention:
         """Whiten the scaled query and key inputs used by the attention kernel."""
         normalizer = self.head_dim**-0.25
@@ -366,11 +378,42 @@ class DarkformerKernelAttention(nn.Module):
         self._increment_projection_version()
         return self
 
+    @torch.no_grad()
+    def initialize_variance_optimal_proposal_(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor | None = None,
+        *,
+        query_mask: torch.Tensor | None = None,
+        key_mask: torch.Tensor | None = None,
+    ) -> DarkformerKernelAttention:
+        """Calibrate Theorem 3.2's proposal on projected kernel inputs."""
+        self.random_features.initialize_variance_optimal_proposal_(
+            query,
+            key,
+            query_mask=query_mask,
+            key_mask=key_mask,
+        )
+        self._increment_projection_version()
+        return self
+
+    @torch.no_grad()
+    def reset_variance_optimal_proposal_(self) -> DarkformerKernelAttention:
+        """Restore isotropic feature sampling and invalidate cached states."""
+        was_active = self.random_features.proposal_is_active
+        self.random_features.reset_variance_optimal_proposal_()
+        if was_active:
+            self._increment_projection_version()
+        return self
+
     def _redraw_generator(self) -> torch.Generator:
         device = self.random_features.projection_matrix.device
         generator = torch.Generator(device=device)
-        seed = int(self._redraw_seed.item()) + int(self._redraw_count.item()) + 1
-        generator.manual_seed(seed % (2**63 - 1))
+        seed = _redraw_stream_seed(
+            int(self._redraw_seed.item()),
+            int(self._redraw_count.item()) + 1,
+        )
+        generator.manual_seed(seed)
         return generator
 
     @torch.no_grad()
@@ -530,24 +573,47 @@ class DarkformerKernelAttention(nn.Module):
         state: CausalAttentionState | None,
     ) -> tuple[torch.Tensor, CausalAttentionState]:
         query_logits = self.random_features.feature_logits(query)
-        key_logits = self.random_features.feature_logits(key)
         query_maximum = query_logits.amax(dim=-1, keepdim=True).detach()
         if self.eps > 0.0:
             query_maximum = query_maximum.clamp_min(0.0)
         feature_scale = self.num_features**-0.5
-        query_features = torch.exp(query_logits - query_maximum)
+        query_logits.sub_(query_maximum)
+        if query.dtype in (torch.float16, torch.bfloat16):
+            query_logits = query_logits.to(query.dtype)
+        query_features = torch.exp(query_logits)
         if self.eps > 0.0:
-            query_features = query_features + self.eps * torch.exp(-query_maximum)
+            query_features = query_features + self.eps * torch.exp(
+                -query_maximum.to(query_features.dtype)
+            )
         query_features = query_features * feature_scale
+        del query_logits
+        key_logits = self.random_features.feature_logits(key)
+        if key_mask is not None:
+            key_logits.masked_fill_(
+                ~key_mask[:, None, :, None],
+                -torch.inf,
+            )
+        scale_floor = 0.0 if self.eps > 0.0 else torch.finfo(key_logits.dtype).min
+        token_scale = key_logits.amax(dim=-1, keepdim=True).detach()
+        token_scale = torch.where(
+            torch.isfinite(token_scale),
+            token_scale,
+            scale_floor,
+        )
+        if self.eps > 0.0:
+            token_scale = token_scale.clamp_min(0.0)
+        arithmetic_token_scale = torch.where(
+            torch.isfinite(token_scale),
+            token_scale,
+            0.0,
+        )
+        key_logits.sub_(arithmetic_token_scale)
+        if query_features.dtype in (torch.float16, torch.bfloat16):
+            key_logits = key_logits.to(query_features.dtype)
         value_dtype = value.dtype
         value = value.to(query_features.dtype)
         batch, heads, _, features = query_features.shape
         value_dim = value.shape[-1]
-        scale_floor = (
-            0.0
-            if self.eps > 0.0
-            else torch.finfo(query_features.dtype).min
-        )
         if state is None:
             key_state = query_features.new_zeros(batch, heads, features)
             key_value_state = query_features.new_zeros(
@@ -556,9 +622,11 @@ class DarkformerKernelAttention(nn.Module):
                 features,
                 value_dim,
             )
-            key_log_scale = query_features.new_full(
+            key_log_scale = torch.full(
                 (batch, heads, 1, 1),
                 scale_floor,
+                device=query.device,
+                dtype=token_scale.dtype,
             )
             sequence_length = 0
         else:
@@ -578,12 +646,19 @@ class DarkformerKernelAttention(nn.Module):
             for name, tensor in (
                 ("state.key_sum", state.key_sum),
                 ("state.key_value_sum", state.key_value_sum),
-                ("state.key_log_scale", state.key_log_scale),
             ):
                 if tensor.device != query.device:
                     raise ValueError(f"{name} must be on the same device as query")
                 if tensor.dtype != query_features.dtype:
                     raise ValueError(f"{name} must have dtype {query_features.dtype}")
+            if state.key_log_scale.device != query.device:
+                raise ValueError(
+                    "state.key_log_scale must be on the same device as query"
+                )
+            if state.key_log_scale.dtype != token_scale.dtype:
+                raise ValueError(
+                    f"state.key_log_scale must have dtype {token_scale.dtype}"
+                )
             if state.sequence_length < 0:
                 raise ValueError("state.sequence_length must be nonnegative")
             if state.projection_version != self._projection_version_value:
@@ -598,104 +673,84 @@ class DarkformerKernelAttention(nn.Module):
         outputs = []
         start = 0
         while start < query_features.shape[2]:
-            window_stop = min(
+            stop = min(
                 start + self.causal_chunk_size,
                 query_features.shape[2],
             )
-            window_logits = key_logits[:, :, start:window_stop]
-            window_mask = None if key_mask is None else key_mask[:, start:window_stop]
-            if window_mask is not None:
-                window_logits = window_logits.masked_fill(
-                    ~window_mask[:, None, :, None],
-                    -torch.inf,
-                )
-            token_scale = window_logits.amax(dim=-1, keepdim=True).detach()
-            first_scale = torch.where(
-                torch.isfinite(token_scale[:, :, :1]),
-                token_scale[:, :, :1],
-                scale_floor,
-            )
-            if self.eps > 0.0:
-                first_scale = first_scale.clamp_min(0.0)
-            calculation_scale = torch.maximum(key_log_scale, first_scale)
-            excessive_rise = token_scale > calculation_scale + 16.0
-            excessive_rise[:, :, 0] = False
-            rise_positions = excessive_rise.any(dim=(0, 1, 3)).nonzero()
-            if rise_positions.numel() > 0:
-                window_stop = start + int(rise_positions[0, 0].item())
-
-            stop = window_stop
             query_chunk = query_features[:, :, start:stop]
             key_logits_chunk = key_logits[:, :, start:stop]
             value_chunk = value[:, :, start:stop]
             key_mask_chunk = None if key_mask is None else key_mask[:, start:stop]
-            arithmetic_scale = torch.where(
-                torch.isfinite(calculation_scale),
-                calculation_scale,
-                0.0,
-            )
-            previous_factor = torch.exp(key_log_scale - arithmetic_scale)
-            key_state = key_state * previous_factor.squeeze(-1)
-            key_value_state = key_value_state * previous_factor
-            scaled_key_logits = key_logits_chunk
-            if key_mask_chunk is not None:
-                scaled_key_logits = scaled_key_logits.masked_fill(
-                    ~key_mask_chunk[:, None, :, None],
-                    -torch.inf,
-                )
-            scaled_key_logits = scaled_key_logits - arithmetic_scale
-            key_chunk = torch.exp(scaled_key_logits)
+            token_scale_chunk = token_scale[:, :, start:stop]
+            arithmetic_token_scale_chunk = arithmetic_token_scale[:, :, start:stop]
+            key_chunk = torch.exp(key_logits_chunk)
             if self.eps > 0.0:
-                key_chunk = key_chunk + self.eps * torch.exp(-arithmetic_scale)
+                key_chunk = key_chunk + self.eps * torch.exp(
+                    -arithmetic_token_scale_chunk.to(key_chunk.dtype)
+                )
             key_chunk = key_chunk * feature_scale
             if key_mask_chunk is not None:
                 key_chunk = key_chunk.masked_fill(
                     ~key_mask_chunk[:, None, :, None],
                     0.0,
                 )
+
+            # Keep every exponential at or below one without choosing split
+            # points on the host. Each query prefix uses its cumulative key
+            # maximum, and the pairwise factors below convert token-local key
+            # features into that prefix scale.
+            running_scale = torch.cat((key_log_scale, token_scale_chunk), dim=2)
+            running_scale = running_scale.cummax(dim=2).values[:, :, 1:]
+            arithmetic_running_scale = torch.where(
+                torch.isfinite(running_scale),
+                running_scale,
+                0.0,
+            )
+            previous_factor = torch.exp(key_log_scale - arithmetic_running_scale).to(
+                query_features.dtype
+            )
+
+            scale_delta = arithmetic_token_scale_chunk.squeeze(-1)[:, :, None, :]
+            scale_delta = (
+                scale_delta - arithmetic_running_scale.squeeze(-1)[:, :, :, None]
+            )
+            scale_factor = torch.exp(scale_delta.clamp_max(0.0)).to(
+                query_features.dtype
+            )
             prefix_scores = torch.matmul(
                 query_chunk,
                 key_chunk.transpose(-1, -2),
-            ).tril_()
+            )
+            prefix_scores = (prefix_scores * scale_factor).tril_()
             denominator = torch.einsum(
                 "bhnm,bhm->bhn",
                 query_chunk,
                 key_state,
             )
+            denominator = denominator * previous_factor.squeeze(-1)
             denominator = denominator + prefix_scores.sum(dim=-1)
             numerator = torch.matmul(query_chunk, key_value_state)
+            numerator = numerator * previous_factor
             numerator = numerator + torch.matmul(prefix_scores, value_chunk)
             outputs.append(_normalize_attention(numerator, denominator))
+
+            # Collapse the chunk into the final running scale for recurrent use.
+            next_scale = running_scale[:, :, -1:]
+            arithmetic_next_scale = arithmetic_running_scale[:, :, -1:]
+            previous_factor = torch.exp(key_log_scale - arithmetic_next_scale).to(
+                query_features.dtype
+            )
+            key_state = key_state * previous_factor.squeeze(-1)
+            key_value_state = key_value_state * previous_factor
+            key_factor = torch.exp(
+                (arithmetic_token_scale_chunk - arithmetic_next_scale).clamp_max(0.0)
+            ).to(query_features.dtype)
+            key_chunk = key_chunk * key_factor
             key_state = key_state + key_chunk.sum(dim=2)
             key_value_state = key_value_state + torch.matmul(
                 key_chunk.transpose(-1, -2),
                 value_chunk,
             )
-            if key_mask_chunk is not None:
-                key_logits_chunk = key_logits_chunk.masked_fill(
-                    ~key_mask_chunk[:, None, :, None],
-                    -torch.inf,
-                )
-            chunk_scale = key_logits_chunk.amax(
-                dim=(-2, -1),
-                keepdim=True,
-            ).detach()
-            chunk_scale = torch.where(
-                torch.isfinite(chunk_scale),
-                chunk_scale,
-                scale_floor,
-            )
-            if self.eps > 0.0:
-                chunk_scale = chunk_scale.clamp_min(0.0)
-            next_scale = torch.maximum(calculation_scale, chunk_scale)
-            arithmetic_next_scale = torch.where(
-                torch.isfinite(next_scale),
-                next_scale,
-                0.0,
-            )
-            next_factor = torch.exp(arithmetic_scale - arithmetic_next_scale)
-            key_state = key_state * next_factor.squeeze(-1)
-            key_value_state = key_value_state * next_factor
             key_log_scale = next_scale
             start = stop
         output = torch.cat(outputs, dim=2)
@@ -900,7 +955,7 @@ class SelfAttention(nn.Module):
         num_features: int | None = None,
         geometry_rank: int | None = None,
         per_head_geometry: bool = True,
-        orthogonal_features: bool = False,
+        orthogonal_features: bool = True,
         causal: bool = False,
         attention_mode: AttentionMode = "linear",
         exact_threshold: int | None = None,
@@ -910,7 +965,7 @@ class SelfAttention(nn.Module):
         output_bias: bool = True,
         rotary: bool = False,
         rotary_base: float = 10_000.0,
-        causal_chunk_size: int = 64,
+        causal_chunk_size: int = 256,
         eps: float = 0.0,
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
@@ -965,6 +1020,10 @@ class SelfAttention(nn.Module):
         """Return the attention covariance for every head."""
         return self.attention.covariance()
 
+    def proposal_covariance(self) -> torch.Tensor:
+        """Return the feature proposal covariance for every head."""
+        return self.attention.proposal_covariance()
+
     @torch.no_grad()
     def initialize_whitening_(
         self,
@@ -973,7 +1032,7 @@ class SelfAttention(nn.Module):
         mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
-        geometry_scale: float = 1.0,
+        geometry_scale: float | None = None,
     ) -> SelfAttention:
         """Initialize geometry from projected queries and keys for sample inputs."""
         query, key, _ = self._project_inputs(inputs)
@@ -988,6 +1047,31 @@ class SelfAttention(nn.Module):
             shrinkage=shrinkage,
             geometry_scale=geometry_scale,
         )
+        return self
+
+    @torch.no_grad()
+    def initialize_variance_optimal_proposal_(
+        self,
+        inputs: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
+    ) -> SelfAttention:
+        """Calibrate Theorem 3.2's proposal from sample self-attention inputs."""
+        query, key, _ = self._project_inputs(inputs)
+        if self.rotary is not None:
+            query, key = self.rotary(query, key)
+        self.attention.initialize_variance_optimal_proposal_(
+            query,
+            key,
+            query_mask=mask,
+            key_mask=mask,
+        )
+        return self
+
+    @torch.no_grad()
+    def reset_variance_optimal_proposal_(self) -> SelfAttention:
+        """Restore isotropic feature sampling."""
+        self.attention.reset_variance_optimal_proposal_()
         return self
 
     def redraw_projection_matrices_(self, *, force: bool = False) -> SelfAttention:
@@ -1088,14 +1172,14 @@ class CrossAttention(nn.Module):
         num_features: int | None = None,
         geometry_rank: int | None = None,
         per_head_geometry: bool = True,
-        orthogonal_features: bool = False,
+        orthogonal_features: bool = True,
         attention_mode: AttentionMode = "linear",
         exact_threshold: int | None = None,
         exact_backend: AttentionBackend = "auto",
         dropout: float = 0.0,
         qkv_bias: bool = False,
         output_bias: bool = True,
-        causal_chunk_size: int = 64,
+        causal_chunk_size: int = 256,
         eps: float = 0.0,
         feature_redraw_interval: int | None = None,
         projection_seed: int | None = None,
@@ -1156,6 +1240,10 @@ class CrossAttention(nn.Module):
         """Return the attention covariance for every head."""
         return self.attention.covariance()
 
+    def proposal_covariance(self) -> torch.Tensor:
+        """Return the feature proposal covariance for every head."""
+        return self.attention.proposal_covariance()
+
     @torch.no_grad()
     def initialize_whitening_(
         self,
@@ -1166,7 +1254,7 @@ class CrossAttention(nn.Module):
         context_mask: torch.Tensor | None = None,
         regularization: float = 1e-4,
         shrinkage: float = 0.0,
-        geometry_scale: float = 1.0,
+        geometry_scale: float | None = None,
     ) -> CrossAttention:
         """Initialize geometry from sample cross-attention queries and keys."""
         query = self._project_query(inputs)
@@ -1182,6 +1270,34 @@ class CrossAttention(nn.Module):
             shrinkage=shrinkage,
             geometry_scale=geometry_scale,
         )
+        return self
+
+    @torch.no_grad()
+    def initialize_variance_optimal_proposal_(
+        self,
+        inputs: torch.Tensor,
+        context: torch.Tensor,
+        *,
+        mask: torch.Tensor | None = None,
+        context_mask: torch.Tensor | None = None,
+    ) -> CrossAttention:
+        """Calibrate Theorem 3.2's proposal from cross-attention inputs."""
+        query = self._project_query(inputs)
+        key, _ = self._project_context(context)
+        if inputs.shape[0] != context.shape[0]:
+            raise ValueError("inputs and context batch sizes must match")
+        self.attention.initialize_variance_optimal_proposal_(
+            query,
+            key,
+            query_mask=mask,
+            key_mask=context_mask,
+        )
+        return self
+
+    @torch.no_grad()
+    def reset_variance_optimal_proposal_(self) -> CrossAttention:
+        """Restore isotropic feature sampling."""
+        self.attention.reset_variance_optimal_proposal_()
         return self
 
     def redraw_projection_matrices_(self, *, force: bool = False) -> CrossAttention:

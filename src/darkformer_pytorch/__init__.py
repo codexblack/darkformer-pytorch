@@ -20,7 +20,7 @@ from darkformer_pytorch.model import (
 )
 from darkformer_pytorch.random_features import DataAwareRandomFeatures
 
-__version__ = "0.1.3"
+__version__ = "1.0.0"
 
 __all__ = [
     "AttentionBackend",
