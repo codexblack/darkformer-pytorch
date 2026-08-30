@@ -200,17 +200,15 @@ covariance toward an isotropic shape but does not uniformly reduce $M$.
 `regularization` is then applied as additive diagonal loading, so the combined
 shrinkage-and-loading expression is intentionally not a convex combination.
 
-Proposition C.1's whitening geometry is also distinct from Theorem 3.2's
-variance-optimal proposal
-$\Sigma^*=(I+2\Lambda)(I-2\Lambda)^{-1}$. The library implements this as a genuinely
-separate proposal: `initialize_variance_optimal_proposal_` estimates $\Lambda$
-after the current kernel transform, samples each head's projections from $\Sigma^*$,
-and splits the exact isotropic-to-proposal density ratio across the query and key
-feature maps. The target kernel remains unchanged and the estimator remains unbiased.
-The initializer raises if an eigenvalue of $\Lambda$ is at least $1/2$, where the
-closed form is not normalizable. Calibrate the proposal after setting the final
-geometry; later geometry training preserves unbiasedness but can make the fixed
-proposal no longer variance-optimal.
+Proposition C.1's whitening geometry is also distinct from Theorem 3.2's variance-optimal proposal:
+
+$$
+\Sigma^*=(I+2\Lambda)(I-2\Lambda)^{-1}
+$$
+
+The library implements this as a genuinely separate proposal: `initialize_variance_optimal_proposal_` estimates $\Lambda$ after the current kernel transform, samples each head's projections from $\Sigma^*$, and splits the exact isotropic-to-proposal density ratio across the query and key feature maps. The target kernel remains unchanged and the estimator remains unbiased. 
+
+The initializer raises if an eigenvalue of $\Lambda$ is at least $1/2$, where the closed form is not normalizable. Calibrate the proposal after setting the final geometry; later geometry training preserves unbiasedness but can make the fixed proposal no longer variance-optimal.
 
 The theorem's variance-optimality claim assumes queries and keys share a zero-mean
 Gaussian law. With unequal or non-Gaussian calibration distributions, the pooled
